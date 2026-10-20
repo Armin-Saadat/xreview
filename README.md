@@ -23,6 +23,9 @@ from this repository.
 - **The reviewer cannot change anything.** Codex runs in its read-only sandbox.
   Claude Code runs with only Read, Grep and Glob, and without settings files,
   hooks, plugins or MCP servers.
+- **Reviewer models:** Codex reviews with GPT-6 Astra at medium effort, and
+  Claude Code with Opus 5.5 at high effort. Either can be changed per machine
+  ([configuration](skills/xreview/references/setup.md#configuration)).
 - **Reviews run in the background**, so no agent's command timeout kills them.
   Answers must match a JSON schema. A crash, timeout, malformed answer or
   `cannot_review` is never treated as an approval.

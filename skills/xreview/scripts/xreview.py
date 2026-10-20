@@ -27,14 +27,15 @@ import sys
 import tempfile
 import time
 
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 REVIEWERS = ('codex', 'claude')
 NAMES = {'codex': 'Codex', 'claude': 'Claude Code'}
 DEFAULT_CONFIG = {
     'timeout_minutes': 30,
     'max_diff_kb': 300,
-    'codex': {'bin': None, 'model': None, 'effort': None},
-    'claude': {'bin': None, 'model': None, 'effort': None},
+    # Reviewer defaults; set a field to null in the config file to use that CLI's own default.
+    'codex': {'bin': None, 'model': 'gpt-6-astra', 'effort': 'medium'},
+    'claude': {'bin': None, 'model': 'claude-opus-5-5', 'effort': 'high'},
 }
 # Names that commonly hold credentials; their contents never go to a reviewer.
 SECRET_GLOBS = ('.env', '.env.*', '*.pem', '*.key', '*.p12', '*.pfx', '*.keystore',
@@ -921,6 +922,9 @@ def cmd_doctor(args):
             continue
         version = run_quiet([binary, '--version'])
         print('  ok   {} ({})'.format(binary, version.strip().splitlines()[0] if version.strip() else 'version unknown'))
+        options = cfg[reviewer]
+        print('  ...  reviews request model {}, effort {}'.format(
+            options.get('model') or 'CLI default', options.get('effort') or 'CLI default'))
         if reviewer == 'codex':
             login = run_quiet([binary, 'login', 'status'])
             if 'logged in' in login.lower() and 'not logged in' not in login.lower():

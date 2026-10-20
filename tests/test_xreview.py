@@ -238,6 +238,28 @@ class ReviewFlow(Base):
             with self.assertRaises(ProcessLookupError):
                 os.kill(call['pid'], 0)
 
+    def test_default_reviewer_models(self):
+        self.change()
+        self.xr('run', '--reviewer', 'codex')
+        self.xr('run', '--reviewer', 'claude')
+        codex, claude = (call['args'] for call in self.calls())
+        self.assertEqual(codex[codex.index('--model') + 1], 'gpt-6-astra')
+        self.assertIn('model_reasoning_effort="medium"', codex)
+        self.assertEqual(claude[claude.index('--model') + 1], 'claude-opus-5-5')
+        self.assertEqual(claude[claude.index('--effort') + 1], 'high')
+
+    def test_null_in_config_uses_the_cli_default(self):
+        self.write_config(codex={'bin': str(self.tmp / 'fakes/codex'), 'model': None, 'effort': None},
+                          claude={'bin': str(self.tmp / 'fakes/claude'), 'model': None, 'effort': None})
+        self.change()
+        self.xr('run', '--reviewer', 'codex')
+        self.xr('run', '--reviewer', 'claude')
+        codex, claude = (call['args'] for call in self.calls())
+        self.assertNotIn('--model', codex)
+        self.assertFalse(any(a.startswith('model_reasoning_effort') for a in codex))
+        self.assertNotIn('--model', claude)
+        self.assertNotIn('--effort', claude)
+
     def test_reviewer_crash_reports_its_error(self):
         self.change()
         code, out = self.xr('run', '--reviewer', 'codex', env={'FAKE_MODE': 'exit1'})

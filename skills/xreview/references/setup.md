@@ -52,19 +52,30 @@ starting a nested review. Neither can review its own work: xreview refuses
 
 ## Configuration
 
-Optional file `~/.config/xreview/config.json` (or the path in `XREVIEW_CONFIG`):
+Reviewers use these models unless you configure others:
+
+| Reviewer | Model | Reasoning effort |
+|---|---|---|
+| Codex | `gpt-6-astra` | `medium` |
+| Claude Code | `claude-opus-5-5` (Opus 5.5) | `high` |
+
+To change them on one machine, create `~/.config/xreview/config.json` (or the
+path in `XREVIEW_CONFIG`) with only the fields you want to change:
 
 ```json
 {
   "timeout_minutes": 30,
   "max_diff_kb": 300,
-  "codex":  {"bin": null, "model": null, "effort": null},
-  "claude": {"bin": null, "model": null, "effort": null}
+  "codex":  {"model": "gpt-6-astra", "effort": "medium"},
+  "claude": {"model": "claude-opus-5-5", "effort": "high"}
 }
 ```
 
-- `null` means the CLI's own default: your Codex `config.toml` model and
-  reasoning effort, and Claude Code's default model.
+- Set `model` or `effort` to `null` to use that CLI's own default instead: your
+  Codex `config.toml` settings, or Claude Code's default model.
+- `doctor` prints the model and effort each reviewer will request on that machine.
+- An account without access to the requested model gets a failed review, never a
+  silent switch to another model.
 - `bin` points at a specific executable when the CLI is not on `PATH`.
 - `--model` and `--effort` on `start` override the file for one review.
 - Reviews are stored under `~/.local/share/xreview/jobs/` (or `XREVIEW_HOME`).
