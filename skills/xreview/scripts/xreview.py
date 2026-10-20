@@ -27,14 +27,15 @@ import sys
 import tempfile
 import time
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 REVIEWERS = ('codex', 'claude')
 NAMES = {'codex': 'Codex', 'claude': 'Claude Code'}
 DEFAULT_CONFIG = {
     'timeout_minutes': 30,
     'max_diff_kb': 300,
     # Reviewer defaults; set a field to null in the config file to use that CLI's own default.
-    'codex': {'bin': None, 'model': 'gpt-6-astra', 'effort': 'medium'},
+    # tools: false = diff-only Codex reviews, for hosts where Codex's sandbox cannot start.
+    'codex': {'bin': None, 'model': 'gpt-6-astra', 'effort': 'medium', 'tools': True},
     'claude': {'bin': None, 'model': 'claude-opus-5-5', 'effort': 'high'},
 }
 # Names that commonly hold credentials; their contents never go to a reviewer.
@@ -132,7 +133,27 @@ TOOL_NOTES = {
              'git diff, git log and git show.',
     'claude': 'You have Read, Grep and Glob only; everything you need from git is '
               'in this prompt.',
+    'codex-diff-only': 'This run has no file or command tools: review only the notes and '
+                       'the diff in this prompt (it shows whole changed functions), and '
+                       'list in not_verified anything that depends on code outside it.',
 }
+# Every Codex review: ignore ~/.codex/config.toml (the user's MCP servers, plugins
+# and hooks, some of which run code outside the sandbox) and turn off connected
+# ChatGPT apps (GitHub, Gmail, Drive, Slack...), plugins, web search and other
+# side tools. The shell stays, inside the read-only sandbox. Login is unaffected:
+# it lives in auth.json, not config.toml.
+CODEX_REVIEWER_FLAGS = [
+    '--ignore-user-config', '--disable', 'apps', '--disable', 'plugins',
+    '--disable', 'multi_agent', '--disable', 'image_generation', '--disable', 'goals',
+    '--disable', 'tool_suggest', '-c', 'web_search="disabled"',
+]
+# Diff-only Codex reviewer: additionally no shell or code execution, so Codex never
+# needs its sandbox (which cannot start on some HPC hosts). apply_patch stays, but
+# the read-only policy still rejects every write.
+CODEX_DIFF_ONLY_FLAGS = [
+    '--disable', 'shell_tool', '--disable', 'unified_exec', '--disable', 'code_mode_host',
+    '--disable', 'view_image',
+]
 
 class Fail(Exception):
     """A user-facing error; the message says what to do."""
@@ -179,7 +200,13 @@ def load_config():
         value = cfg.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             raise Fail('{} in {} must be a positive number'.format(key, path))
+    if not isinstance(cfg['codex'].get('tools', True), bool):
+        raise Fail('"codex": {{"tools": ...}} in {} must be true or false'.format(path))
     return cfg
+
+
+def diff_only(reviewer, options):
+    return reviewer == 'codex' and options.get('tools') is False
 
 
 def write_json(path, data):
@@ -262,8 +289,11 @@ def looks_binary(data):
     return b'\0' in data[:8192]
 
 
-def collect_changes(repo, base, max_bytes):
-    """Return the review packet: diff text, git status and bookkeeping, all from git."""
+def collect_changes(repo, base, max_bytes, function_context=False):
+    """Return the review packet: diff text, git status and bookkeeping, all from git.
+
+    function_context shows whole changed functions, for reviewers that cannot
+    open files themselves."""
     head_proc = git(repo, 'rev-parse', '--verify', '-q', 'HEAD', check=False)
     has_head = head_proc.returncode == 0
     head = head_proc.stdout.decode().strip() if has_head else None
@@ -288,7 +318,7 @@ def collect_changes(repo, base, max_bytes):
         target = 'all files (the repository has no commits yet)'
 
     diff_opts = ['-c', 'core.quotepath=off', 'diff', '--no-color', '--no-ext-diff',
-                 '--find-renames', '-U5']
+                 '--find-renames', '--function-context' if function_context else '-U5']
     names = git_text(repo, '-c', 'core.quotepath=off', 'diff', '--name-only', base_sha).splitlines()
     tracked_diff = git_text(repo, *(diff_opts + [base_sha, '--', '.'] + secret_pathspecs()))
     hidden = sorted(n for n in names if is_secret_name(n))
@@ -384,20 +414,23 @@ def truncate_diff(diff, max_bytes, skipped):
 
 # ------------------------------------------------------------ building a job
 
-def build_prompt(reviewer, packet, repo, intent, project_rules):
+def build_prompt(reviewer, packet, repo, intent, project_rules, without_tools=False):
     tag = secrets.token_hex(4)
     omitted = []
     if packet['hidden']:
         omitted.append('Not shown (possible credentials): ' + ', '.join(packet['hidden']))
     if packet['skipped']:
         omitted.append('Not inlined:\n' + '\n'.join('- ' + s for s in packet['skipped']))
+        if without_tools:
+            omitted.append('You cannot open the files listed above in this run; name them in not_verified.')
     rules = ''
     if project_rules:
         rules = ('\nProject review instructions (from .xreview.md, written by the user):\n'
                  '<<<PROJECT-{0}\n{1}\nPROJECT-{0}>>>\n'.format(tag, project_rules.strip()))
     author = NAMES['claude' if reviewer == 'codex' else 'codex']
+    note = TOOL_NOTES['codex-diff-only' if without_tools else reviewer]
     return REVIEW_PROMPT.format(
-        author=author, tool_note=TOOL_NOTES[reviewer], project_rules=rules, tag=tag,
+        author=author, tool_note=note, project_rules=rules, tag=tag,
         intent=(intent or '(none given)').strip(), target=packet['target'], repo=repo,
         branch=packet['branch'], head=(packet['head'] or 'none')[:12],
         omitted=('\n'.join(omitted) + '\n') if omitted else '',
@@ -410,11 +443,13 @@ def reviewer_command(reviewer, binary, options, repo, job):
         cmd = [binary, 'exec', '--sandbox', 'read-only', '-c', 'approval_policy="never"',
                '--ephemeral', '--color', 'never', '--cd', str(repo),
                '--output-schema', str(job / 'schema.json'),
-               '--output-last-message', str(job / 'reviewer-output.txt')]
+               '--output-last-message', str(job / 'reviewer-output.txt')] + CODEX_REVIEWER_FLAGS
         if model:
             cmd += ['--model', model]
         if effort:
             cmd += ['-c', 'model_reasoning_effort=' + json.dumps(effort)]
+        if diff_only(reviewer, options):
+            cmd += CODEX_DIFF_ONLY_FLAGS
         return cmd + ['-']
     # Claude Code: print mode, only file-reading tools confined to the repo,
     # no settings files, hooks, MCP servers, skills or saved session.
@@ -513,7 +548,8 @@ def cmd_start(args, wait_after=False):
     intent = args.intent
     if args.intent_file:
         intent = Path(args.intent_file).expanduser().read_text(encoding='utf-8')
-    packet = collect_changes(repo, args.base, int(cfg['max_diff_kb'] * 1024))
+    without_tools = diff_only(reviewer, options)
+    packet = collect_changes(repo, args.base, int(cfg['max_diff_kb'] * 1024), function_context=without_tools)
     if not packet['diff'].strip() and not packet['skipped']:
         raise Fail('nothing to review: no changes {}. If the work is committed, pass '
                    '--base <branch-or-commit>.'.format(
@@ -525,7 +561,8 @@ def cmd_start(args, wait_after=False):
                 continue
             meta = refresh(meta)
             same = (meta.get('digest') == packet['digest'] and
-                    (meta.get('model'), meta.get('effort')) == (options.get('model'), options.get('effort')))
+                    (meta.get('model'), meta.get('effort'), bool(meta.get('diff_only'))) ==
+                    (options.get('model'), options.get('effort'), without_tools))
             if not same:
                 continue
             if meta.get('status') in ('queued', 'running'):
@@ -543,7 +580,7 @@ def cmd_start(args, wait_after=False):
     rules_file = repo / '.xreview.md'
     if rules_file.is_file():
         project_rules = rules_file.read_text(encoding='utf-8', errors='replace')
-    prompt = build_prompt(reviewer, packet, repo, intent, project_rules)
+    prompt = build_prompt(reviewer, packet, repo, intent, project_rules, without_tools=without_tools)
 
     created = now_utc()
     job_id = created.strftime('%Y%m%d-%H%M%S-') + secrets.token_hex(2)
@@ -560,7 +597,7 @@ def cmd_start(args, wait_after=False):
         'target': packet['target'], 'digest': packet['digest'],
         'files_changed': packet['files_changed'], 'diff_bytes': packet['full_diff_bytes'],
         'hidden_files': packet['hidden'], 'not_inlined': packet['skipped'],
-        'model': options.get('model'), 'effort': options.get('effort'),
+        'model': options.get('model'), 'effort': options.get('effort'), 'diff_only': without_tools,
         'command': command, 'timeout_minutes': cfg['timeout_minutes'], 'created': iso(created),
     }
     write_json(job / 'meta.json', meta)
@@ -577,8 +614,12 @@ def cmd_start(args, wait_after=False):
         max(1, packet['full_diff_bytes'] // 1024)))
     if packet['hidden']:
         print('Not sent (look like credentials): ' + ', '.join(packet['hidden']))
+    if without_tools:
+        print('Diff-only review (this machine has "codex": {"tools": false}): the reviewer sees the diff but cannot open files.')
     if packet['skipped']:
-        print('Not inlined: {} file(s); the reviewer may read them directly.'.format(len(packet['skipped'])))
+        print('Not inlined: {} file(s); {}.'.format(
+            len(packet['skipped']), 'a diff-only reviewer cannot see them' if without_tools
+            else 'the reviewer may read them directly'))
     print('Next: {} wait {}'.format(self_cmd(), job_id))
     return wait_for(job_id, None) if wait_after else EXIT_OK
 
@@ -712,6 +753,9 @@ def render(meta, review):
                  meta['target'], meta['repo'], meta['branch'], (meta.get('head') or 'none')[:12]),
              '- Model: {}{}{}'.format(model, ', effort ' + effort if effort else '',
                                       ', sandbox ' + reported['sandbox'] if reported.get('sandbox') else '')]
+    if meta.get('diff_only'):
+        lines.append('- Mode: **diff only**: the reviewer saw the diff (whole changed functions) '
+                     'but could not open other files on this machine')
     if review.get('note'):
         lines.append('- Note: ' + review['note'])
     if meta.get('hidden_files'):
@@ -936,13 +980,21 @@ def cmd_doctor(args):
                 probe = run_quiet([binary, 'sandbox', '--', '/bin/sh', '-c',
                                    'echo read-ok; touch x 2>/dev/null && echo write-allowed || echo write-blocked'],
                                   cwd=tmp)
+            without_tools = diff_only(reviewer, options)
             if 'read-ok' in probe and 'write-blocked' in probe:
                 print('  ok   Codex read-only sandbox works on this machine')
+                if without_tools:
+                    print('  WARN diff-only mode is on although the sandbox works; full reviews can also '
+                          'open files. Remove "tools": false from {} to use them.'.format(config_path()))
+            elif without_tools:
+                print('  ok   Codex sandbox cannot start here; diff-only mode is on, so Codex reviews '
+                      'see the diff but cannot open files')
             else:
-                print('  FAIL Codex read-only sandbox does not work here; Codex reviews would fail. '
-                      'Output: ' + (probe.strip()[-300:] or 'none'))
+                print('  FAIL Codex read-only sandbox does not work here, so Codex reviews would fail. '
+                      'For diff-only reviews on this machine, add "codex": {{"tools": false}} to {}. '
+                      'Output: {}'.format(config_path(), probe.strip()[-300:] or 'none'))
                 ok = False
-            missing_host = codex_missing_code_mode_host(binary)
+            missing_host = None if without_tools else codex_missing_code_mode_host(binary)
             if missing_host:
                 print('  WARN {} is missing next to the Codex binary, so this Codex may be unable to run '
                       'any commands. Reinstall Codex, or set "codex": {{"bin": ...}} to a complete '
@@ -960,7 +1012,7 @@ def cmd_doctor(args):
                       'in a terminal on this machine.')
                 ok = False
         if args.live:
-            ok = live_check(reviewer) and ok
+            ok = live_check(reviewer, without_tools=diff_only(reviewer, options)) and ok
     print('All checks passed.' if ok else 'Some checks failed; see above.')
     return EXIT_OK if ok else EXIT_ERROR
 
@@ -1008,19 +1060,30 @@ def hit_rate(hits, total):
 '''
 
 
-def live_check(reviewer):
-    """A real, tiny review whose planted bug is only visible by reading a file
-    outside the diff: proves login, model access and file reading together."""
+LIVE_DIFF_BEFORE = 'def mean(xs):\n    """Arithmetic mean of a non-empty list."""\n    return sum(xs) / len(xs)\n'
+LIVE_DIFF_AFTER = 'def mean(xs):\n    """Arithmetic mean of a non-empty list."""\n    return sum(xs) / (len(xs) - 1)\n'
+
+
+def live_check(reviewer, without_tools=False):
+    """A real, tiny review of a planted bug. Normally the bug is only visible by
+    reading a file outside the diff, which proves login, model access and file
+    reading together; a diff-only reviewer gets a bug inside the diff instead."""
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp)
         git(repo, 'init', '-q')
-        (repo / 'helpers.py').write_text(LIVE_HELPER, encoding='utf-8')
+        if without_tools:
+            (repo / 'stats.py').write_text(LIVE_DIFF_BEFORE, encoding='utf-8')
+        else:
+            (repo / 'helpers.py').write_text(LIVE_HELPER, encoding='utf-8')
         git(repo, 'add', '.')
         git(repo, '-c', 'user.email=x@x', '-c', 'user.name=x', 'commit', '-qm', 'init')
-        (repo / 'metrics.py').write_text(LIVE_CALLER, encoding='utf-8')
+        if without_tools:
+            (repo / 'stats.py').write_text(LIVE_DIFF_AFTER, encoding='utf-8')
+        else:
+            (repo / 'metrics.py').write_text(LIVE_CALLER, encoding='utf-8')
         print('  ...  running a real {} review of a planted bug (uses a little of your quota)'.format(NAMES[reviewer]))
         ns = argparse.Namespace(reviewer=reviewer, repo=str(repo), base=None,
-                                intent='Add hit_rate() for the cache dashboard.',
+                                intent='Tidy up mean().' if without_tools else 'Add hit_rate() for the cache dashboard.',
                                 intent_file=None, model=None, effort=None, force=True)
         env_backup = {k: os.environ.pop(k) for k in ('CLAUDECODE', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID')
                       if k in os.environ}
@@ -1029,7 +1092,9 @@ def live_check(reviewer):
         finally:
             os.environ.update(env_backup)
     if code == EXIT_CHANGES:
-        print('  ok   live review worked and caught a bug that needed reading another file')
+        print('  ok   live review worked and caught {}'.format(
+            'a planted bug in the diff (diff-only mode)' if without_tools
+            else 'a bug that needed reading another file'))
         return True
     print('  FAIL the live review did not report the planted bug (exit code {}). If it says it could '
           'not read files, this reviewer cannot inspect your code on this machine.'.format(code))

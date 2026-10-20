@@ -25,6 +25,8 @@ FAKE = textwrap.dedent('''\
     if args[:2] == ['auth', 'status']:
         print(json.dumps({{'loggedIn': True}})); sys.exit(0)
     if args[:1] == ['sandbox']:
+        if os.environ.get('FAKE_SANDBOX') == 'broken':
+            print('error building bubblewrap command: unsupported host mount at /data'); sys.exit(1)
         print('read-ok'); print('write-blocked'); sys.exit(0)
     if args[:2] == ['features', 'list']:
         print('shell_tool  stable  true'); sys.exit(0)
@@ -155,6 +157,12 @@ class ReviewFlow(Base):
         self.assertEqual(call['role'], 'reviewer')
         self.assertIn('read-only', call['args'])
         self.assertEqual(call['args'][-1], '-')
+        # No user MCP servers, plugins, connected apps or web search for the reviewer.
+        self.assertIn('--ignore-user-config', call['args'])
+        for feature in ('apps', 'plugins'):
+            self.assertEqual(call['args'][call['args'].index(feature) - 1], '--disable')
+        self.assertIn('web_search="disabled"', call['args'])
+        self.assertNotIn('shell_tool', call['args'])          # full reviews keep the sandboxed shell
 
     def test_claude_reviewer_is_read_only_and_reports_changes(self):
         self.change()
@@ -259,6 +267,44 @@ class ReviewFlow(Base):
         self.assertFalse(any(a.startswith('model_reasoning_effort') for a in codex))
         self.assertNotIn('--model', claude)
         self.assertNotIn('--effort', claude)
+
+    def diff_only_config(self):
+        self.write_config(codex={'bin': str(self.tmp / 'fakes/codex'), 'tools': False},
+                          claude={'bin': str(self.tmp / 'fakes/claude')})
+
+    def test_diff_only_codex_gets_no_tools_and_whole_functions(self):
+        body = ['def long_function(xs):', '    first_line_marker = 1']
+        body += ['    step_%d = %d' % (i, i) for i in range(30)] + ['    return sum(xs)', '']
+        (self.repo / 'long.py').write_text('\n'.join(body))
+        self.git(self.repo, 'add', 'long.py')
+        self.git(self.repo, 'commit', '-qm', 'add long function')
+        (self.repo / 'long.py').write_text('\n'.join(body).replace('return sum(xs)', 'return sum(xs) + 1'))
+        code, out = self.xr('run', '--reviewer', 'codex')
+        self.assertEqual(code, 0, out)
+        prompt = (Path(self.meta(self.job_id(out))['job_dir']) / 'prompt.md').read_text()
+        self.assertNotIn('first_line_marker', prompt)          # normal reviews: -U5 context
+        self.diff_only_config()
+        code, out = self.xr('run', '--reviewer', 'codex')
+        self.assertEqual(code, 0, out)
+        self.assertIn('Diff-only review', out)
+        self.assertIn('Mode: **diff only**', out)
+        job = self.meta(self.job_id(out))
+        self.assertTrue(job['diff_only'])
+        prompt = (Path(job['job_dir']) / 'prompt.md').read_text()
+        self.assertIn('first_line_marker', prompt)             # whole changed function
+        self.assertIn('no file or command tools', prompt)
+        args = self.calls()[-1]['args']
+        for flag in ('shell_tool', 'unified_exec', 'code_mode_host', 'plugins', 'web_search="disabled"'):
+            self.assertIn(flag, args)
+        self.assertIn('read-only', args)
+
+    def test_diff_only_applies_to_codex_only(self):
+        self.diff_only_config()
+        self.change()
+        code, out = self.xr('run', '--reviewer', 'claude')
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('diff only', out)
+        self.assertNotIn('shell_tool', self.calls()[-1]['args'])
 
     def test_reviewer_crash_reports_its_error(self):
         self.change()
@@ -403,6 +449,24 @@ class Guards(Base):
         code, out = self.xr('start', '--reviewer', 'codex', cwd=plain)
         self.assertEqual(code, 1)
         self.assertIn('not inside a git repository', out)
+
+    def test_doctor_broken_sandbox_suggests_diff_only(self):
+        code, out = self.xr('doctor', '--reviewer', 'codex', env={'FAKE_SANDBOX': 'broken'})
+        self.assertEqual(code, 1, out)
+        self.assertIn('"codex": {"tools": false}', out)
+
+    def test_doctor_broken_sandbox_ok_in_diff_only_mode(self):
+        self.write_config(codex={'bin': str(self.tmp / 'fakes/codex'), 'tools': False})
+        code, out = self.xr('doctor', '--reviewer', 'codex', env={'FAKE_SANDBOX': 'broken'})
+        self.assertEqual(code, 0, out)
+        self.assertIn('diff-only mode is on', out)
+
+    def test_tools_setting_must_be_boolean(self):
+        self.write_config(codex={'bin': str(self.tmp / 'fakes/codex'), 'tools': 'no'})
+        self.change()
+        code, out = self.xr('start', '--reviewer', 'codex')
+        self.assertEqual(code, 1, out)
+        self.assertIn('must be true or false', out)
 
     def test_doctor_with_fakes(self):
         code, out = self.xr('doctor')

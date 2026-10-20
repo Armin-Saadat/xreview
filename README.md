@@ -20,9 +20,10 @@ from this repository.
   unstaged and untracked changes from git itself. The author's notes are
   labelled as unverified claims, and files that look like credentials are
   never sent.
-- **The reviewer cannot change anything.** Codex runs in its read-only sandbox.
-  Claude Code runs with only Read, Grep and Glob, and without settings files,
-  hooks, plugins or MCP servers.
+- **The reviewer cannot change anything.** Codex runs in its read-only sandbox,
+  without your Codex config, so without your MCP servers, plugins, hooks and
+  connected ChatGPT apps (GitHub, Gmail, Drive, Slack...). Claude Code runs with only
+  Read, Grep and Glob, and without settings files, hooks, plugins or MCP servers.
 - **Reviewer models:** Codex reviews with GPT-6 Astra at medium effort, and
   Claude Code with Opus 5.5 at high effort. Either can be changed per machine
   ([configuration](skills/xreview/references/setup.md#configuration)).
@@ -113,10 +114,13 @@ reviewer cannot infer, such as "the test split never feeds model selection".
 Models, timeouts, permissions, what is sent, and troubleshooting are in
 [skills/xreview/references/setup.md](skills/xreview/references/setup.md).
 
-**HPC and container hosts.** Codex's sandbox does not work on some of them
-(`bwrap: ... Operation not permitted`). `doctor` reports this, and Codex reviews
-fail there with an explicit error instead of running unsandboxed. Use Claude Code
-as the reviewer on those hosts.
+**HPC and container hosts.** Codex's sandbox cannot start on some of them
+(`bwrap: ... Operation not permitted`, or `unsupported host mount` when home is a
+bind mount). `doctor` reports this, and xreview never runs Codex without its
+sandbox. Instead, set `"codex": {"tools": false}` in that machine's
+`~/.config/xreview/config.json` for **diff-only** Codex reviews: Codex gets the
+diff, with whole changed functions, but no tools at all, and each review is
+labelled as such. Claude Code reviews need no sandbox and work there unchanged.
 
 ## Get updates
 

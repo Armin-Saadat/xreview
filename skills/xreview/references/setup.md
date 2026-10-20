@@ -35,7 +35,8 @@ little of each account's quota.
 
 | Reviewer | Command xreview runs | Access |
 |---|---|---|
-| Codex | `codex exec --sandbox read-only -c approval_policy="never" --ephemeral --output-schema ...` | Read-only shell inside Codex's sandbox (cat, rg, git diff, ...); no writes, no network |
+| Codex | `codex exec --sandbox read-only -c approval_policy="never" --ephemeral --ignore-user-config --disable apps --disable plugins ...` with web search off | Read-only shell inside Codex's sandbox (cat, rg, git diff, ...); no writes, no network. None of your MCP servers, plugins, hooks or connected ChatGPT apps (GitHub, Gmail, Drive, Slack...) |
+| Codex, diff-only mode (`"tools": false`) | the same, plus `--disable shell_tool --disable unified_exec --disable code_mode_host --disable view_image` | No shell or files either: only the diff in the prompt, with whole changed functions. Writes are still rejected by the read-only policy |
 | Claude Code | `claude -p --restricted --tools Read,Grep,Glob --strict-mcp-config --permission-mode dontAsk --no-session-persistence --disable-slash-commands --json-schema ...` | Read, Grep and Glob inside the repository only; no shell, settings files, hooks, plugins or MCP servers |
 
 Both run in a fresh session with `XREVIEW_ROLE=reviewer`, which stops xreview from
@@ -71,12 +72,18 @@ path in `XREVIEW_CONFIG`) with only the fields you want to change:
 }
 ```
 
-- Set `model` or `effort` to `null` to use that CLI's own default instead: your
-  Codex `config.toml` settings, or Claude Code's default model.
+- Set `model` or `effort` to `null` to use that CLI's built-in default instead.
+  Codex reviews ignore your `~/.codex/config.toml` (so that none of your MCP servers,
+  plugins or hooks reach the reviewer), so its settings do not apply to reviews.
 - `doctor` prints the model and effort each reviewer will request on that machine.
 - An account without access to the requested model gets a failed review, never a
   silent switch to another model.
 - `bin` points at a specific executable when the CLI is not on `PATH`.
+- `"codex": {"tools": false}` switches Codex to diff-only reviews, for hosts where its
+  sandbox cannot start (see [troubleshooting](#troubleshooting)). Codex then sees the
+  diff, with whole changed functions, but cannot open other files, so it misses bugs
+  that need other code; every such review says "diff only". Use it only where
+  `doctor` reports the sandbox as broken.
 - `--model` and `--effort` on `start` override the file for one review.
 - Reviews are stored under `~/.local/share/xreview/jobs/` (or `XREVIEW_HOME`).
 
@@ -112,7 +119,7 @@ example:
 | `Claude Code is not logged in for command-line use` | Run `claude auth login` in a terminal on that machine |
 | `Codex is not logged in` | Run `codex login` |
 | `codex-code-mode-host is missing` warning, or Codex returns `cannot_review` saying it could not read files | That Codex is a bare binary without its companion tools. Reinstall it with OpenAI's installer: `curl -fsSL https://chatgpt.com/codex/install.sh \| sh` |
-| `Codex read-only sandbox does not work here` (for example `bwrap: ... Operation not permitted` on HPC or container hosts) | Codex reviews cannot run on that host. Use Claude Code as the reviewer there; nothing falls back to running without a sandbox |
+| `Codex read-only sandbox does not work here` (for example `bwrap: ... Operation not permitted`, or `unsupported host mount` on hosts whose home is a bind mount) | Codex cannot run commands in its sandbox on that host, and xreview never runs it without one. Add `"codex": {"tools": false}` to that machine's config for diff-only Codex reviews, or rely on Claude Code reviews there |
 | `running inside the Codex sandbox` | Re-run `start` with escalated permissions |
 | `Operation not permitted` writing `~/.local/share/xreview` | The shell is sandboxed; run `start` outside the sandbox |
 | `nothing to review` | No changes against HEAD; for committed work pass `--base <branch-or-commit>` |
