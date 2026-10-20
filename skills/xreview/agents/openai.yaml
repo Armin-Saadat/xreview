@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cross-agent review"
+  short_description: "Independent review of your changes by Claude Code"
+  default_prompt: "Use $xreview to get an independent review of my current changes."

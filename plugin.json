@@ -1,0 +1,35 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "xreview",
+  "version": "0.1.0",
+  "description": "Cross-agent code review: Codex reviews Claude Code's work and Claude Code reviews Codex's, read-only, from the real git diff, with checks for ML experiment validity.",
+  "author": {
+    "name": "Armin Saadat"
+  },
+  "homepage": "https://github.com/Armin-Saadat/xreview",
+  "repository": "https://github.com/Armin-Saadat/xreview",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "codex",
+    "claude-code",
+    "second-opinion",
+    "ml-experiments"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "xreview",
+        "shortDescription": "Independent review of your changes by Claude Code",
+        "longDescription": "One skill, xreview. Before Codex calls substantial work done, it starts a read-only Claude Code review built from the real git diff (staged, unstaged and untracked files, credentials filtered), waits for a structured verdict, fixes what holds up and reports the rest. Installed in Claude Code, the same plugin has Codex review Claude's work. Reviews check correctness and, for research code, data leakage, split hygiene, checkpoint selection and metric correctness.",
+        "developerName": "Armin Saadat",
+        "category": "Productivity",
+        "defaultPrompt": [
+          "Use $xreview to get an independent review of my current changes.",
+          "Review everything on this branch since main with $xreview."
+        ],
+        "websiteURL": "https://github.com/Armin-Saadat/xreview"
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+schema_version: "1.1"
+name: quiet-on-question
+description: A plain question about the code does not trigger a review.
+tags: [trigger, negative]
+runs: 3
+expected_outcome: The agent explains train.py without invoking xreview.
+execution:
+  prompt: |
+    What does train.py do? Explain it in a few sentences; don't change anything.
+  max_turns: 10
+  timeout_seconds: 300
+  allowed_tools: [Read, Glob, Grep, Skill]
+context:
+  scaffold_script: scaffold.sh
+graders:
+  - name: no-review
+    type: tool_used
+    tool: Skill
+    input_match: '"skill"\s*:\s*"(?:[\w-]+:)?xreview"'
+    min: 0
+    max: 0
+    arm: both

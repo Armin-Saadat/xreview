@@ -1,0 +1,14 @@
+{
+  "name": "xreview",
+  "owner": { "name": "Armin Saadat" },
+  "description": "Cross-agent code review between Claude Code and Codex.",
+  "plugins": [
+    {
+      "name": "xreview",
+      "source": "./",
+      "description": "Have Codex review Claude Code's work and Claude Code review Codex's, read-only, from the real git diff.",
+      "category": "development",
+      "keywords": ["code-review", "codex", "claude-code", "second-opinion", "ml-experiments"]
+    }
+  ]
+}

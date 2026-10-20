@@ -1,0 +1,26 @@
+schema_version: "1.1"
+name: fires-after-implementing
+description: After changing experiment logic itself, the agent requests a cross-agent review before reporting done.
+tags: [trigger, positive]
+runs: 3
+expected_outcome: The agent edits train.py, runs it, then invokes the xreview skill before its final answer.
+execution:
+  prompt: |
+    Add early stopping to train() in train.py: evaluate accuracy on the validation
+    split after every epoch, keep the weights from the best epoch, and stop after 5
+    epochs without improvement. Run python3 train.py to check it still works, then
+    tell me when you are done.
+  max_turns: 40
+  timeout_seconds: 900
+  allowed_tools: [Read, Glob, Grep, Skill]
+context:
+  scaffold_script: scaffold.sh
+graders:
+  - name: skill-fired
+    type: tool_used
+    tool: Skill
+    input_match: '"skill"\s*:\s*"(?:[\w-]+:)?xreview"'
+  - name: review-started
+    type: tool_used
+    tool: Bash
+    input_match: 'xreview\.py(\\")?\s+(start|run)\b'
