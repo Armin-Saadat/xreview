@@ -64,6 +64,16 @@ so instead of calling the work done, and show the error. Common causes are a
 reviewer that is not logged in or a sandboxed shell; see
 [troubleshooting](references/setup.md#troubleshooting).
 
+**Diff-only results** end with `(diff only)`: on that machine the reviewer can
+read the diff but cannot open other files, so an approval is partial evidence.
+It is a property of the machine, so do not try to work around it with other
+folders, other reviewers or re-runs. When the change depends on code outside the
+diff, or is experiment-critical (data, splits, preprocessing, training,
+evaluation, metrics, job scripts), tell the user what the reviewer could not
+see, and ask before launching official runs or jobs on it. A full review can run
+on a machine where the reviewer has file access, for example after the branch is
+pushed, with `start --base <branch-point>`.
+
 ## Rules that keep the review honest
 
 - **Do not curate the evidence.** The reviewer sees the full diff; your notes are

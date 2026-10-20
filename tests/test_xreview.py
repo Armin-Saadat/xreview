@@ -145,7 +145,7 @@ class ReviewFlow(Base):
         code, out = self.xr('wait', job, '--timeout', '60')
         self.assertEqual(code, 0, out)
         self.assertIn('Verdict: **approve**', out)
-        self.assertIn('XREVIEW {}: approve'.format(job), out)
+        self.assertIn('XREVIEW {}: approve (0 blocker'.format(job), out)      # full review: no diff-only tag
         prompt = (self.tmp / 'state/jobs' / job / 'prompt.md').read_text()
         self.assertIn('-    return sum(xs) / len(xs)', prompt)
         self.assertIn('+    return sum(xs) / (len(xs) - 1)', prompt)
@@ -288,6 +288,7 @@ class ReviewFlow(Base):
         self.assertEqual(code, 0, out)
         self.assertIn('Diff-only review', out)
         self.assertIn('Mode: **diff only**', out)
+        self.assertIn(': approve (diff only) (0 blocker', out)
         job = self.meta(self.job_id(out))
         self.assertTrue(job['diff_only'])
         prompt = (Path(job['job_dir']) / 'prompt.md').read_text()

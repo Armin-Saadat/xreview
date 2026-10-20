@@ -27,7 +27,7 @@ import sys
 import tempfile
 import time
 
-VERSION = '0.3.0'
+VERSION = '0.3.1'
 REVIEWERS = ('codex', 'claude')
 NAMES = {'codex': 'Codex', 'claude': 'Claude Code'}
 DEFAULT_CONFIG = {
@@ -889,9 +889,10 @@ def show_result(job_id):
     print((job / 'review.md').read_text(encoding='utf-8'))
     counts = meta.get('counts') or {}
     print('Review files: {}/review.md (raw: review.json, prompt.md)'.format(job))
-    print('XREVIEW {}: {} ({} blocker, {} major, {} minor, {} nit)'.format(
-        meta['id'], meta['verdict'], counts.get('blocker', 0), counts.get('major', 0),
-        counts.get('minor', 0), counts.get('nit', 0)))
+    # A diff-only verdict is weaker evidence; say so on the line agents act on.
+    print('XREVIEW {}: {}{} ({} blocker, {} major, {} minor, {} nit)'.format(
+        meta['id'], meta['verdict'], ' (diff only)' if meta.get('diff_only') else '',
+        counts.get('blocker', 0), counts.get('major', 0), counts.get('minor', 0), counts.get('nit', 0)))
     return {'approve': EXIT_OK, 'changes_requested': EXIT_CHANGES}.get(meta['verdict'], EXIT_CANNOT)
 
 

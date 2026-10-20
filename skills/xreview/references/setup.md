@@ -120,6 +120,7 @@ example:
 | `Codex is not logged in` | Run `codex login` |
 | `codex-code-mode-host is missing` warning, or Codex returns `cannot_review` saying it could not read files | That Codex is a bare binary without its companion tools. Reinstall it with OpenAI's installer: `curl -fsSL https://chatgpt.com/codex/install.sh \| sh` |
 | `Codex read-only sandbox does not work here` (for example `bwrap: ... Operation not permitted`, or `unsupported host mount` on hosts whose home is a bind mount) | Codex cannot run commands in its sandbox on that host, and xreview never runs it without one. Add `"codex": {"tools": false}` to that machine's config for diff-only Codex reviews, or rely on Claude Code reviews there |
+| `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` (Codex 0.157+), or `unsupported host mount` (0.156.x) | The host blocks the user namespaces Codex's sandbox needs; common on Ubuntu 24.04 with `kernel.apparmor_restrict_unprivileged_userns=1` and no system `bubblewrap`, for example container login nodes. An administrator can install the distribution's `bubblewrap` package (it carries the AppArmor profile); until then use diff-only mode there |
 | `running inside the Codex sandbox` | Re-run `start` with escalated permissions |
 | `Operation not permitted` writing `~/.local/share/xreview` | The shell is sandboxed; run `start` outside the sandbox |
 | `nothing to review` | No changes against HEAD; for committed work pass `--base <branch-or-commit>` |
