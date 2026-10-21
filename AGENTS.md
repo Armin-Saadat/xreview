@@ -48,6 +48,10 @@ into projects that install the plugin.
   Reject malformed answers; do not repair or drop parts of them.
 - Never run a reviewer with a permission bypass or outside its sandbox, and never
   fall back to one when the sandbox fails.
+- Reviewers only ever see the review copy (what git would commit, minus
+  credential-like and `private` paths, plus committed `readable` ones), never the
+  repository itself: whatever a reviewer reads goes to its provider. Codex's shell
+  must stay under the permission profile that confines its reads to that copy.
 - Never print or send credentials. Extend `SECRET_GLOBS` rather than special-casing.
 - Every behaviour change gets a test in `tests/test_xreview.py`. Use the fake CLI
   (`FAKE_MODE`) rather than real model calls.

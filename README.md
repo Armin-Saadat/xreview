@@ -17,13 +17,19 @@ from this repository.
     typo fixes (3 of 3 each).
   - Codex triggered the skill from its description alone.
 - **The reviewer sees what actually changed.** xreview collects staged,
-  unstaged and untracked changes from git itself. The author's notes are
-  labelled as unverified claims, and files that look like credentials are
-  never sent.
-- **The reviewer cannot change anything.** Codex runs in its read-only sandbox,
-  without your Codex config, so without your MCP servers, plugins, hooks and
-  connected ChatGPT apps (GitHub, Gmail, Drive, Slack...). Claude Code runs with only
-  Read, Grep and Glob, and without settings files, hooks, plugins or MCP servers.
+  unstaged and untracked changes from git itself, code first. The author's notes
+  are labelled as unverified claims.
+- **The reviewer sees only what git would commit.** It works in a private copy of
+  the repository: git-ignored data and outputs, files that look like credentials,
+  and paths you mark `private` in `.xreview.json` never reach it, because whatever
+  it reads goes to its provider. You can allow specific ignored outputs, such as a
+  metrics file, under `readable`.
+- **The reviewer cannot change anything.** Codex's shell runs under a permission
+  profile that can read only the review copy (not your home folder, other
+  repositories or `/tmp`), with no writes or network, and without your Codex config,
+  so without your MCP servers, plugins, hooks and connected ChatGPT apps (GitHub,
+  Gmail, Drive, Slack...). Claude Code runs in the copy with only Read, Grep and Glob,
+  and without settings files, hooks, plugins or MCP servers.
 - **Reviewer models:** Codex reviews with GPT-6 Astra at medium effort, and
   Claude Code with Opus 5.5 at high effort. Either can be changed per machine
   ([configuration](skills/xreview/references/setup.md#configuration)).
@@ -94,8 +100,9 @@ Collaborators still install the plugin once themselves.
 python3 skills/xreview/scripts/xreview.py doctor --live
 ```
 
-It checks both CLIs and their logins, Codex's read-only sandbox, and one real
-review per reviewer. That review uses a little of each account's quota.
+It checks both CLIs and their logins, that Codex's sandboxed shell can read the
+review copy and nothing else, and runs one real review per reviewer. That review
+uses a little of each account's quota.
 
 **Without a plugin system**, copy `skills/xreview/` into `~/.claude/skills/` (Claude
 Code) or `~/.agents/skills/` (Codex) for every project, or into a project's
@@ -109,18 +116,30 @@ reports the verdict, the fixes, any disputed findings and the path of
 `review.md`. To ask for a review yourself, use `/xreview:xreview` in Claude Code,
 `$xreview` in Codex, or just say "get a second opinion on this".
 
+After fixes, the agent reviews again with `--followup`, so the reviewer first
+checks its previous findings; findings that predate the change are reported
+separately and never block. `--paths` reviews one piece of a larger change.
+
 Put a `.xreview.md` at a repository root to give every review there rules a
-reviewer cannot infer, such as "the test split never feeds model selection".
-Models, timeouts, permissions, what is sent, and troubleshooting are in
+reviewer cannot infer, such as "the test split never feeds model selection". Put
+a `.xreview.json` there to keep data away from reviewers, or to let them read
+selected outputs:
+
+```json
+{"private": ["data/", "splits/*_ids.csv"], "readable": ["outputs/*/metrics.json"]}
+```
+
+`readable` entries take effect once committed. Models, timeouts, permissions, what
+is sent, and troubleshooting are in
 [skills/xreview/references/setup.md](skills/xreview/references/setup.md).
 
 **HPC and container hosts.** Codex's sandbox cannot start on some of them
 (`bwrap: ... Operation not permitted`, or `unsupported host mount`). `doctor`
 reports this, and xreview never runs Codex without its sandbox. Instead, set
 `"codex": {"tools": "repo"}` in that machine's `~/.config/xreview/config.json`:
-Codex then has no shell and reads the repository through xreview's own read-only
-tools (list, read and search files, plus git history, confined to the repository). Claude
-Code reviews need no sandbox and work there unchanged.
+Codex then has no shell and reads the review copy through xreview's own read-only
+tools (list, read and search files, plus git history). Claude Code reviews need no
+sandbox and work there unchanged.
 
 ## Get updates
 

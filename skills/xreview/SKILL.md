@@ -32,6 +32,9 @@ the user asks; skip when they say so.
      itself (staged, unstaged and untracked files), so do not paste code into
      `--intent`.
    - Work that is already committed: add `--base <branch-or-commit>`.
+   - To review one piece of a larger change early, add `--paths <files or folders>`.
+     The result then says `(partial)`; the rest stays readable as context, and the
+     whole change still needs its own review before you call it done.
    - If your commands run in a sandbox without network access, run `start` with
      escalated permissions (outside the sandbox); it exits with that advice when
      it detects the sandbox.
@@ -42,14 +45,16 @@ the user asks; skip when they say so.
      it until it prints a result.
 4. **Assess every finding against the code.** Fix the real ones and re-run the
    tests. When you disagree, say why with evidence. If your fixes were
-   substantive, review again; stop after 3 rounds and report what is still open.
+   substantive, review again with `start --followup` (plus your notes on what you
+   fixed or dispute): the reviewer first checks its previous findings. Stop after
+   3 rounds and report what is still open.
 5. **Report to the user:** the reviewer and verdict, what you fixed, what you
    disputed and why, and the path of `review.md`.
 
 ## Reading the result
 
-The last line is `XREVIEW <job-id>: <verdict> (<counts>)`. The exit code says the
-same thing:
+The last line is `XREVIEW <job-id>: <verdict> (<counts>)`, with `(diff only)` or
+`(partial)` after the verdict when they apply. The exit code says the same thing:
 
 | Exit | Verdict | Meaning |
 |---|---|---|
@@ -64,6 +69,11 @@ so instead of calling the work done, and show the error. Common causes are a
 reviewer that is not logged in or a sandboxed shell; see
 [troubleshooting](references/setup.md#troubleshooting).
 
+**Pre-existing findings** (counted as `pre-existing`, listed under "Already there
+before this change") are problems the change did not introduce. They never block.
+Tell the user about them; fix them only if asked or if this work depends on them.
+Each finding's `Impact` line says what goes wrong and when, for triage.
+
 **Diff-only results** end with `(diff only)`: on that machine the reviewer can
 read the diff but cannot open other files, so an approval is partial evidence.
 It is a property of the machine, so do not try to work around it with other
@@ -74,14 +84,25 @@ see, and ask before launching official runs or jobs on it. A full review can run
 on a machine where the reviewer has file access, for example after the branch is
 pushed, with `start --base <branch-point>`.
 
+## What the reviewer can read
+
+The reviewer works in a private copy of the repository that holds only what git
+would commit, plus your uncommitted changes. Git-ignored files (data, outputs,
+caches), credential-like files, and paths the project marks `private` in
+`.xreview.json` never reach it, because whatever it reads goes to its provider.
+If a review needs an ignored output, such as a metrics file, ask the user whether
+to list it under `readable` in `.xreview.json` ([format](references/setup.md#what-the-reviewer-can-read)).
+`readable` entries only take effect once committed, so never add or commit one
+without the user's approval.
+
 ## Rules that keep the review honest
 
 - **Do not curate the evidence.** The reviewer sees the full diff; your notes are
   labelled as unverified claims. Say what you are unsure about instead of
   steering the reviewer away from it.
 - **Do not outsource validation.** Never ask the reviewer to run tests or jobs.
-- **Credentials stay out.** Files such as `.env`, keys and `.netrc` are never sent.
-  Do not quote secrets in `--intent`.
+- **Credentials and private data stay out.** Files such as `.env`, keys and
+  `.netrc` are never sent. Do not quote secrets or private records in `--intent`.
 - **One review per state.** xreview refuses to re-review an unchanged diff (pass
   `--force` only for a deliberate second opinion) and reuses a review that is
   still running for the same changes.

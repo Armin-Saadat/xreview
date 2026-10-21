@@ -1,7 +1,9 @@
 """Offline tests: fake codex/claude executables stand in for the real reviewers."""
+import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -10,6 +12,9 @@ import time
 import unittest
 
 SCRIPT = Path(__file__).resolve().parent.parent / 'skills' / 'xreview' / 'scripts' / 'xreview.py'
+_spec = importlib.util.spec_from_file_location('xreview_module', str(SCRIPT))
+xreview = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(xreview)
 
 # One fake handles both CLIs. FAKE_MODE picks the behaviour.
 FAKE = textwrap.dedent('''\
@@ -25,26 +30,33 @@ FAKE = textwrap.dedent('''\
     if args[:2] == ['auth', 'status']:
         print(json.dumps({{'loggedIn': True}})); sys.exit(0)
     if args[:1] == ['sandbox']:
-        if os.environ.get('FAKE_SANDBOX') == 'broken':
+        sandbox = os.environ.get('FAKE_SANDBOX')
+        if sandbox == 'broken':
             print('error building bubblewrap command: unsupported host mount at /data'); sys.exit(1)
-        print('read-ok'); print('write-blocked'); sys.exit(0)
+        print('inside-ok'); print('outside-readable' if sandbox == 'open' else 'outside-blocked')
+        print('write-blocked'); sys.exit(0)
     if args[:2] == ['features', 'list']:
         print('shell_tool  stable  true'); sys.exit(0)
     prompt = sys.stdin.read()
     if log:
+        files = sorted(os.path.relpath(os.path.join(d, n), os.getcwd())
+                       for d, _, names in os.walk(os.getcwd()) for n in names)
         with open(log, 'a') as f:
-            f.write(json.dumps({{'args': args, 'role': os.environ.get('XREVIEW_ROLE'),
-                                 'pid': os.getpid(), 'prompt_len': len(prompt)}}) + '\\n')
+            f.write(json.dumps({{'args': args, 'role': os.environ.get('XREVIEW_ROLE'), 'cwd': os.getcwd(),
+                                 'files': files, 'pid': os.getpid(), 'prompt_len': len(prompt)}}) + '\\n')
     mode = os.environ.get('FAKE_MODE', 'approve')
     if mode.startswith('sleep'):
         time.sleep(float(mode[5:] or 30))
         mode = 'approve'
     if mode == 'exit1':
         sys.stderr.write('boom: model unavailable\\n'); sys.exit(1)
-    finding = {{'severity': 'blocker', 'title': 'Divides by n-1', 'file': 'stats.py', 'line': 2,
-               'details': 'mean() is biased', 'suggested_fix': 'divide by len(xs)'}}
+    finding = {{'severity': 'blocker', 'origin': 'introduced', 'title': 'Divides by n-1', 'file': 'stats.py',
+               'line': 2, 'impact': 'Every mean is biased high.', 'details': 'mean() is biased',
+               'suggested_fix': 'divide by len(xs)'}}
+    older = dict(finding, severity='major', origin='pre_existing', title='Old helper has no tests')
     review = {{
         'approve': {{'verdict': 'approve', 'summary': 'Looks right.', 'findings': [], 'not_verified': []}},
+        'preexisting': {{'verdict': 'approve', 'summary': 'Fine.', 'findings': [older], 'not_verified': []}},
         'blocker': {{'verdict': 'changes_requested', 'summary': 'One bug.', 'findings': [finding],
                     'not_verified': ['did not run tests']}},
         'inconsistent': {{'verdict': 'approve', 'summary': 'Fine?', 'findings': [finding], 'not_verified': []}},
@@ -155,7 +167,17 @@ class ReviewFlow(Base):
         self.assertIn('Fix mean', prompt)
         call = self.calls()[0]
         self.assertEqual(call['role'], 'reviewer')
-        self.assertIn('read-only', call['args'])
+        # Shell reviews run under xreview's permission profile, which reads only the copy.
+        self.assertIn('default_permissions="xreview"', call['args'])
+        self.assertNotIn('--sandbox', call['args'])
+        self.assertTrue(any(a.startswith('permissions.xreview.filesystem=') and ':workspace_roots' in a
+                            for a in call['args']))
+        self.assertIn('permissions.xreview.network.enabled=false', call['args'])
+        self.assertIn('--skip-git-repo-check', call['args'])
+        self.assertTrue(call['cwd'].endswith(os.path.join(job, 'tree')), call['cwd'])
+        self.assertIn('new_module.py', call['files'])
+        self.assertNotIn('.env', call['files'])
+        self.assertFalse(Path(call['cwd']).exists())           # the copy is deleted afterwards
         self.assertEqual(call['args'][-1], '-')
         # No user MCP servers, plugins, connected apps or web search for the reviewer.
         self.assertIn('--ignore-user-config', call['args'])
@@ -315,8 +337,12 @@ class ReviewFlow(Base):
         server = [a for a in args if a.startswith('mcp_servers.xreview_repo.args=')]
         self.assertEqual(len(server), 1)
         server_args = json.loads(server[0].split('=', 1)[1])
-        self.assertEqual(server_args[1:], ['_repo_tools', str(self.repo.resolve())])
+        tree = str(Path(job['job_dir']) / 'tree')
+        self.assertEqual(server_args[1:], ['_repo_tools', tree, '--git-dir', str(self.repo.resolve() / '.git'),
+                                           '--policy', str(Path(job['job_dir']) / 'policy.json')])
         self.assertTrue(server_args[0].endswith('xreview.py'))
+        self.assertEqual(args[args.index('--cd') + 1], tree)
+        self.assertIn('read-only', args)                   # no shell here, so the plain sandbox flag
         self.assertIn('--ignore-user-config', args)
         prompt = (Path(job['job_dir']) / 'prompt.md').read_text()
         self.assertIn('xreview_repo tools', prompt)
@@ -509,17 +535,298 @@ class Guards(Base):
     def test_doctor_with_fakes(self):
         code, out = self.xr('doctor')
         self.assertEqual(code, 0, out)
-        self.assertIn('Codex read-only sandbox works', out)
+        self.assertIn("Codex's sandboxed shell works here and reads only the review copy", out)
         self.assertIn('Claude Code is logged in', out)
 
 
-class RepoToolsServer(Base):
-    """The MCP server Codex uses in repo mode: it must only ever read, inside the repo."""
+class ReviewScope(Base):
+    """What reaches the reviewer: the review copy, .xreview.json, inlining order, scope and rounds."""
 
-    def rpc(self, *requests, root=None):
+    def write_policy(self, commit=False, **policy):
+        (self.repo / '.xreview.json').write_text(json.dumps(policy))
+        if commit:
+            self.git(self.repo, 'add', '.xreview.json')
+            self.git(self.repo, 'commit', '-qm', 'review policy')
+
+    def prompt(self, out):
+        return (Path(self.meta(self.job_id(out))['job_dir']) / 'prompt.md').read_text()
+
+    def test_reviewers_work_in_a_copy_without_ignored_files(self):
+        (self.repo / '.gitignore').write_text('outputs/\n')
+        (self.repo / 'outputs').mkdir()
+        (self.repo / 'outputs' / 'per_study.csv').write_text('study,label\nS1,1\n')
+        self.git(self.repo, 'add', '.gitignore')
+        self.git(self.repo, 'commit', '-qm', 'ignore outputs')
+        self.change()
+        (self.repo / 'new.py').write_text('NEW = 1\n')
+        outside = self.tmp / 'outside.txt'
+        outside.write_text('outside\n')
+        os.symlink(str(outside), str(self.repo / 'leak'))
+        os.symlink('stats.py', str(self.repo / 'alias.py'))
+        for reviewer in ('codex', 'claude'):
+            code, out = self.xr('run', '--reviewer', reviewer, '--force')
+            self.assertEqual(code, 0, out)
+            self.assertIn('Review copy:', out)
+            call = self.calls()[-1]
+            self.assertEqual(sorted(call['files']), ['.gitignore', 'alias.py', 'new.py', 'stats.py'], reviewer)
+            self.assertEqual((Path(self.meta(self.job_id(out))['job_dir']) / 'tree').exists(), False)
+            prompt = self.prompt(out)
+            self.assertIn('Files you can open: your working directory is a copy', prompt)
+            self.assertIn('leak (symlink to something outside the review copy; not followed)', prompt)
+            self.assertNotIn('S1,1', prompt)
+
+    def test_readable_ignored_files_need_a_commit(self):
+        (self.repo / '.gitignore').write_text('outputs/\n')
+        run = self.repo / 'outputs' / 'run1'
+        run.mkdir(parents=True)
+        (run / 'metrics.json').write_text('{"auc": 0.81}\n')
+        (run / 'per_study.csv').write_text('S1,1\n')
+        self.git(self.repo, 'add', '.gitignore')
+        self.git(self.repo, 'commit', '-qm', 'ignore outputs')
+        self.change()
+        self.write_policy(readable=['outputs/*/metrics.json'])
+        code, out = self.xr('run', '--reviewer', 'codex')
+        self.assertEqual(code, 0, out)
+        self.assertIn('take effect once committed; not used yet: outputs/*/metrics.json', out)
+        self.assertNotIn('outputs/run1/metrics.json', self.calls()[-1]['files'])
+        self.write_policy(commit=True, readable=['outputs/*/metrics.json'])
+        code, out = self.xr('run', '--reviewer', 'codex')
+        self.assertEqual(code, 0, out)
+        self.assertIn('1 git-ignored file(s) are allowed by .xreview.json', out)
+        files = self.calls()[-1]['files']
+        self.assertIn('outputs/run1/metrics.json', files)
+        self.assertNotIn('outputs/run1/per_study.csv', files)
+        self.assertIn('- outputs/run1/metrics.json (modified ', self.prompt(out))
+        (run / 'metrics.json').write_text('{"auc": 0.82}\n')     # a changed output is a new review state
+        code, out = self.xr('run', '--reviewer', 'codex')
+        self.assertNotIn('already reviewed', out)
+
+    def test_private_paths_never_reach_the_reviewer(self):
+        (self.repo / 'data').mkdir()
+        (self.repo / 'data' / 'ids.csv').write_text('id\nP0001\n')
+        (self.repo / 'notes').mkdir()
+        (self.repo / 'notes' / 'ids.csv').write_text('id\nP0002\n')
+        self.git(self.repo, 'add', '.')
+        self.git(self.repo, 'commit', '-qm', 'tracked id lists')
+        (self.repo / 'data' / 'ids.csv').write_text('id\nP0001\nP0003\n')
+        (self.repo / 'notes' / 'ids.csv').write_text('id\nP0002\nP0004\n')
+        self.change()
+        self.write_policy(private=['data/', 'ids.csv'])          # uncommitted narrowing applies at once
+        for reviewer in ('codex', 'claude'):
+            code, out = self.xr('run', '--reviewer', reviewer, '--force')
+            self.assertEqual(code, 0, out)
+            self.assertIn('Not sent (private in .xreview.json): 2 changed file(s)', out)
+            prompt = self.prompt(out)
+            for marker in ('P0001', 'P0002', 'P0003', 'P0004', 'data/ids.csv', 'notes/ids.csv'):
+                self.assertNotIn(marker, prompt)
+            self.assertIn('(len(xs) - 1)', prompt)
+            files = self.calls()[-1]['files']
+            self.assertNotIn('data/ids.csv', files)
+            self.assertNotIn('notes/ids.csv', files)
+            self.assertIn('stats.py', files)
+
+    def test_symlinked_folder_cannot_stand_in_for_another_file(self):
+        (self.repo / 'public').mkdir()
+        (self.repo / 'public' / 'records.csv').write_text('public row\n')
+        (self.repo / 'private_data').mkdir()
+        (self.repo / 'private_data' / 'records.csv').write_text('zz-private-row\n')
+        self.git(self.repo, 'add', '.')
+        self.git(self.repo, 'commit', '-qm', 'two folders')
+        shutil.rmtree(str(self.repo / 'public'))
+        os.symlink('private_data', str(self.repo / 'public'))     # the index still lists public/records.csv
+        self.write_policy(private=['private_data/'])
+        self.change()
+        code, out = self.xr('run', '--reviewer', 'claude')
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('public/records.csv', self.calls()[-1]['files'])
+        self.assertNotIn('private_data/records.csv', self.calls()[-1]['files'])
+        self.assertNotIn('zz-private-row', self.prompt(out))
+        self.assertIn('public/records.csv (reached through a symlinked folder; not copied)', self.prompt(out))
+
+    def test_project_rules_are_checked_too(self):
+        self.change()
+        (self.repo / '.xreview.md').write_text('RULES-MARKER: the test split never feeds selection.\n')
+        code, out = self.xr('run', '--reviewer', 'codex')
+        self.assertIn('RULES-MARKER', self.prompt(out))
+        outside = self.tmp / 'outside-rules.md'
+        outside.write_text('zz-outside-rules\n')
+        (self.repo / '.xreview.md').unlink()
+        os.symlink(str(outside), str(self.repo / '.xreview.md'))
+        code, out = self.xr('run', '--reviewer', 'codex', '--force')
+        self.assertEqual(code, 0, out)
+        self.assertIn('.xreview.md is not a regular file', out)
+        self.assertNotIn('zz-outside-rules', self.prompt(out))
+        (self.repo / '.xreview.md').unlink()
+        (self.repo / '.xreview.md').write_text('zz-private-rules\n')
+        self.write_policy(private=['.xreview.md'])
+        code, out = self.xr('run', '--reviewer', 'codex', '--force')
+        self.assertIn('.xreview.md is marked private', out)
+        self.assertNotIn('zz-private-rules', self.prompt(out))
+
+    def test_only_private_changes_is_nothing_to_review(self):
+        (self.repo / 'secret_ids.csv').write_text('P0001\n')
+        self.write_policy(commit=True, private=['secret_ids.csv'])
+        code, out = self.xr('start', '--reviewer', 'codex')
+        self.assertEqual(code, 1, out)
+        self.assertIn('only files that .xreview.json marks private changed', out)
+
+    def test_invalid_policy_fails_closed(self):
+        self.change()
+        for text, message in (('{not json', 'is not valid JSON'),
+                              (json.dumps({'private': ['!keep.csv']}), 'negated patterns are not supported'),
+                              (json.dumps({'privat': ['data/']}), 'unknown key "privat"'),
+                              (json.dumps({'private': 'data/'}), 'must be a list of path patterns'),
+                              (json.dumps({'private': ['../data']}), 'not a path pattern')):
+            (self.repo / '.xreview.json').write_text(text)
+            code, out = self.xr('start', '--reviewer', 'codex')
+            self.assertEqual(code, 1, out)
+            self.assertIn(message, out)
+        self.assertEqual(self.calls(), [])
+
+    def test_code_is_inlined_before_data(self):
+        self.write_config(max_diff_kb=6)
+        (self.repo / 'results').mkdir()
+        (self.repo / 'results' / 'a.csv').write_text('row,value\n' + 'r,1\n' * 6000)
+        (self.repo / 'results' / 'b.csv').write_text('row,value\nsmall,2\n')
+        (self.repo / 'zz_model.py').write_text('MODEL_MARKER = 1\n' * 100)
+        code, out = self.xr('run', '--reviewer', 'codex')
+        self.assertEqual(code, 0, out)
+        prompt = self.prompt(out)
+        self.assertIn('+MODEL_MARKER = 1', prompt)
+        self.assertRegex(prompt, r'results/a\.csv \(\d+ KB new file; data or other non-code file, not inlined\)')
+        self.assertIn('+small,2', prompt)
+        self.assertLess(prompt.index('+MODEL_MARKER'), prompt.index('+small,2'))
+        self.assertIn('results/a.csv', self.calls()[-1]['files'])  # still in the copy
+
+    def test_partial_review_with_paths(self):
+        self.change()
+        (self.repo / 'other.py').write_text('OTHER_MARKER = 1\n')
+        code, out = self.xr('run', '--reviewer', 'codex', '--paths', 'stats.py')
+        self.assertEqual(code, 0, out)
+        self.assertIn(': approve (partial) (0 blocker', out)
+        self.assertIn('Scope: **partial**, only changes under stats.py', out)
+        prompt = self.prompt(out)
+        self.assertIn('(len(xs) - 1)', prompt)
+        self.assertNotIn('+OTHER_MARKER', prompt)
+        self.assertIn('Scope: only the changes under stats.py', prompt)
+        self.assertIn('other.py', self.calls()[-1]['files'])       # the rest stays readable as context
+        code, out = self.xr('start', '--reviewer', 'codex', '--paths', str(self.tmp / 'elsewhere'))
+        self.assertEqual(code, 1, out)
+        self.assertIn('outside the repository', out)
+
+    def test_followup_passes_previous_findings(self):
+        self.change()
+        code, out = self.xr('run', '--reviewer', 'codex', env={'FAKE_MODE': 'blocker'})
+        self.assertEqual(code, 2, out)
+        first = self.job_id(out)
+        self.assertIn('Impact: Every mean is biased high.', out)
+        (self.repo / 'stats.py').write_text('def mean(xs):\n    return sum(xs) / len(xs) if xs else 0.0\n')
+        code, out = self.xr('run', '--reviewer', 'codex', '--followup')
+        self.assertEqual(code, 0, out)
+        self.assertIn('Follow-up: round 2, after review ' + first, out)
+        self.assertIn('Round 2: follows up review ' + first, out)
+        prompt = self.prompt(out)
+        self.assertIn('Follow-up review: this is round 2', prompt)
+        self.assertIn('[BLOCKER] Divides by n-1 (stats.py:2): mean() is biased', prompt)
+        self.assertIn('Files changed since that round: stats.py', prompt)
+        meta = self.meta(self.job_id(out))
+        self.assertEqual((meta['round'], meta['followup_of']), (2, first))
+        code, out = self.xr('start', '--reviewer', 'codex', '--followup', 'no-such-job')
+        self.assertEqual(code, 1, out)
+
+    def test_pre_existing_findings_do_not_block(self):
+        self.change()
+        code, out = self.xr('run', '--reviewer', 'codex', env={'FAKE_MODE': 'preexisting'})
+        self.assertEqual(code, 0, out)
+        self.assertIn('Already there before this change (does not block)', out)
+        self.assertIn('No findings in this change.', out)
+        self.assertIn('approve (0 blocker, 0 major, 0 minor, 0 nit; 1 pre-existing)', out)
+
+    def test_shell_mode_fails_closed_without_confinement(self):
+        self.change()
+        for sandbox in ('open', 'broken'):
+            code, out = self.xr('run', '--reviewer', 'codex', '--force', env={'FAKE_SANDBOX': sandbox})
+            self.assertEqual(code, 1, out)
+            self.assertIn('could not confine its shell to the review copy', out)
+        self.assertEqual(self.calls(), [])                            # the reviewer never started
+        code, out = self.xr('run', '--reviewer', 'claude', env={'FAKE_SANDBOX': 'open'})
+        self.assertEqual(code, 0, out)                                # Claude is confined by --restricted
+
+    def test_doctor_fails_when_shell_is_not_confined(self):
+        code, out = self.xr('doctor', '--reviewer', 'codex', env={'FAKE_SANDBOX': 'open'})
+        self.assertEqual(code, 1, out)
+        self.assertIn('cannot keep its shell inside the review copy', out)
+
+
+class PathPatterns(unittest.TestCase):
+    """.xreview.json patterns follow .gitignore rules; check them against git itself."""
+
+    FILES = ['top.txt', 'a.csv', 'deep/x/b.csv', 'data/raw/c.txt', 'data', 'src/data/d.py', 'logs/1/e.log',
+             'cache/f', 'src/cache/g', 'abc.txt', 'axc.txt', 'ax.txt', 'bx.txt', 'outputs/r1/metrics.json',
+             'outputs/r1/sub/metrics.json', 'docs/top.txt']
+    PATTERNS = ['*.csv', 'data/', 'data', '/top.txt', 'top.txt', 'outputs/*/metrics.json', 'logs/**',
+                '**/cache', 'a?c.txt', '[ab]x.txt', '[!a]x.txt', 'src/**/d.py', 'outputs/**/metrics.json']
+
+    def test_matches_gitignore_semantics(self):
+        tmp = Path(tempfile.mkdtemp(prefix='xreview-patterns-'))
+        try:
+            subprocess.run(['git', 'init', '-q', str(tmp)], check=True)
+            files = [f for f in self.FILES if f != 'data']
+            for rel in files:
+                (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
+                (tmp / rel).write_text('x\n')
+            for pattern in self.PATTERNS:
+                (tmp / '.gitignore').write_text(pattern + '\n')
+                out = subprocess.run(['git', '-C', str(tmp), 'ls-files', '-z', '-o', '-i', '--exclude-standard'],
+                                     stdout=subprocess.PIPE, check=True).stdout.decode()
+                expected = {n for n in out.split('\0') if n}
+                regex, _ = xreview.path_pattern(pattern)
+                actual = {f for f in files if regex.match(f)}
+                self.assertEqual(actual, expected, pattern)
+        finally:
+            shutil.rmtree(str(tmp))
+
+    def test_history_pathspecs_select_the_same_files(self):
+        tmp = Path(tempfile.mkdtemp(prefix='xreview-pathspecs-'))
+        try:
+            subprocess.run(['git', 'init', '-q', str(tmp)], check=True)
+            files = [f for f in self.FILES if f != 'data']
+            for rel in files:
+                (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
+                (tmp / rel).write_text('x\n')
+            subprocess.run(['git', '-C', str(tmp), 'add', '.'], check=True)
+            for pattern in self.PATTERNS:
+                regex, specs = xreview.path_pattern(pattern)
+                out = subprocess.run(['git', '-C', str(tmp), 'ls-files', '-z', '--', '.'] +
+                                     [':(exclude,glob)' + s for s in specs],
+                                     stdout=subprocess.PIPE, check=True).stdout.decode()
+                kept = {n for n in out.split('\0') if n}
+                self.assertEqual(kept, {f for f in files if not regex.match(f)}, pattern)
+        finally:
+            shutil.rmtree(str(tmp))
+
+
+class RepoToolsServer(Base):
+    """The MCP server Codex reads the review copy with: it must only ever read, inside the copy."""
+
+    def make_copy(self, private=()):
+        policy = xreview.ScopePolicy(private=private)
+        names, _ = xreview.review_scope(self.repo, policy)
+        copy = self.tmp / 'copy'
+        if copy.exists():
+            shutil.rmtree(str(copy))
+        xreview.build_review_copy(self.repo, copy, names)
+        self.copy = copy
+        self.policy_file = self.tmp / 'policy.json'
+        self.policy_file.write_text(json.dumps({'private': list(private)}))
+
+    def rpc(self, *requests, root=None, git_dir=True):
         lines = ''.join(json.dumps(r) + '\n' for r in requests)
-        proc = subprocess.run([sys.executable, str(SCRIPT), '_repo_tools', str(root or self.repo)], input=lines,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+        cmd = [sys.executable, str(SCRIPT), '_repo_tools', str(root or self.copy)]
+        if git_dir:
+            cmd += ['--git-dir', str(self.repo / '.git'), '--policy', str(self.policy_file)]
+        proc = subprocess.run(cmd, input=lines, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True, timeout=60)
         return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
 
     def call(self, name, **arguments):
@@ -540,6 +847,7 @@ class RepoToolsServer(Base):
         outside = self.tmp / 'outside.txt'
         outside.write_text('outside secret\n')
         os.symlink(str(outside), str(self.repo / 'link_out'))
+        self.make_copy()
 
     def test_protocol(self):
         replies = self.rpc(
@@ -564,18 +872,27 @@ class RepoToolsServer(Base):
         failed, text = self.call('read_file', path='new_untracked.py')
         self.assertFalse(failed, text)
 
+    def test_large_files_are_read_in_pages(self):
+        (self.repo / 'big.txt').write_text(''.join('line %d\n' % i for i in range(1, 400001)))
+        self.make_copy()
+        failed, text = self.call('read_file', path='big.txt', start_line=350000, max_lines=2)
+        self.assertFalse(failed, text)
+        self.assertIn('350000\tline 350000', text)
+        self.assertIn('call again with start_line=350002', text)
+
     def test_listing_and_search_skip_secrets(self):
         failed, text = self.call('list_files')
         self.assertFalse(failed, text)
         self.assertIn('new_untracked.py', text)
         self.assertIn('pkg/mod.py', text)
         self.assertNotIn('.env', text)
+        self.assertNotIn('link_out', text)
         failed, text = self.call('list_files', path='pkg', glob='*.py')
         self.assertEqual(text.strip(), 'pkg/mod.py')
         failed, text = self.call('search', pattern='helper')
         self.assertIn('helpers.py:1:', text)
         self.assertIn('pkg/mod.py:1:', text)
-        failed, text = self.call('search', pattern='TOKEN')
+        failed, text = self.call('search', pattern='TOKEN|outside secret')
         self.assertEqual(text, '(no matches)')
         failed, text = self.call('search', pattern='(unclosed')
         self.assertTrue(failed)
@@ -600,13 +917,48 @@ class RepoToolsServer(Base):
         failed, text = self.call('git', command='status')
         self.assertTrue(failed)
 
+    def test_no_history_without_a_git_dir(self):
+        reply = self.rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                          'params': {'name': 'git', 'arguments': {'command': 'log'}}}, git_dir=False)[0]
+        self.assertTrue(reply['result']['isError'])
+        self.assertIn('history is not available', reply['result']['content'][0]['text'])
+
+    def test_private_paths_stay_out_of_history(self):
+        (self.repo / 'data').mkdir()
+        (self.repo / 'data' / 'ids.csv').write_text('zz-private-ids\n')
+        (self.repo / 'deep').mkdir()
+        (self.repo / 'deep' / 'study_ids.csv').write_text('zz-private-deep\n')
+        self.git(self.repo, 'add', 'data', 'deep')
+        self.git(self.repo, 'commit', '-qm', 'id lists')
+        self.make_copy(private=['data/', 'study_ids.csv'])
+        for arguments in ({'command': 'show'}, {'command': 'log'}, {'command': 'diff', 'rev': 'HEAD~1..HEAD'}):
+            failed, text = self.call('git', **arguments)
+            self.assertFalse(failed, arguments)
+            for marker in ('zz-private', 'data/ids.csv', 'study_ids.csv'):
+                self.assertNotIn(marker, text, arguments)
+        for name, arguments in (('read_file', {'path': 'data/ids.csv'}),
+                                ('git', {'command': 'show', 'path': 'data/ids.csv'}),
+                                ('git', {'command': 'log', 'path': 'deep/study_ids.csv'})):
+            failed, text = self.call(name, **arguments)
+            self.assertTrue(failed, arguments)
+            self.assertIn('private', text)
+
+    def test_unreadable_policy_turns_history_off(self):
+        self.policy_file.write_text('{broken')
+        failed, text = self.call('git', command='log')
+        self.assertTrue(failed)
+        self.assertIn('history is off', text)
+        failed, text = self.call('read_file', path='helpers.py')
+        self.assertFalse(failed, text)
+
     def test_git_filters_never_run(self):
-        # A clean filter configured for .py files would run if git touched the working tree.
+        # A clean filter configured for .py files would run if git touched a working tree.
         marker = self.tmp / 'filter-ran'
         self.git(self.repo, 'config', 'filter.marker.clean', "sh -c 'touch %s; cat'" % marker)
         self.git(self.repo, 'config', 'diff.marker.textconv', "sh -c 'touch %s; cat \"$1\"' --" % marker)
         (self.repo / '.gitattributes').write_text('*.py filter=marker diff=marker\n')
         (self.repo / 'helpers.py').write_text('def helper():\n    return 43\n')
+        self.make_copy()
         for name, arguments in (('git', {'command': 'log'}), ('git', {'command': 'show'}),
                                 ('git', {'command': 'diff', 'rev': 'HEAD~1..HEAD'}),
                                 ('search', {'pattern': 'helper'}), ('read_file', {'path': 'helpers.py'}),
@@ -630,7 +982,7 @@ class RepoToolsServer(Base):
             self.assertTrue(failed, arguments)
             self.assertNotIn('s3cr3t-val', text, arguments)
 
-    def test_search_does_not_follow_directory_links(self):
+    def test_copy_does_not_follow_directory_links(self):
         outside = self.tmp / 'outside-dir'
         outside.mkdir()
         (outside / 'conf.txt').write_text('needle outside the repository\n')
@@ -638,10 +990,12 @@ class RepoToolsServer(Base):
         (self.repo / 'linked' / 'conf.txt').write_text('needle inside\n')
         self.git(self.repo, 'add', 'linked/conf.txt')
         self.git(self.repo, 'commit', '-qm', 'tracked file under a directory')
-        import shutil as _shutil
-        _shutil.rmtree(str(self.repo / 'linked'))
+        shutil.rmtree(str(self.repo / 'linked'))
         os.symlink(str(outside), str(self.repo / 'linked'))       # the index still lists linked/conf.txt
         os.symlink(str(self.repo / '.git'), str(self.repo / 'gitlink'))
+        self.make_copy()
+        self.assertFalse((self.copy / 'linked').exists())
+        self.assertFalse((self.copy / 'gitlink').exists())
         failed, text = self.call('search', pattern='needle|repositoryformatversion')
         self.assertNotIn('outside the repository', text)
         self.assertNotIn('repositoryformatversion', text)
@@ -649,6 +1003,11 @@ class RepoToolsServer(Base):
         self.assertTrue(failed)
         failed, text = self.call('read_file', path='gitlink/config')
         self.assertTrue(failed)
+        # A symlink planted in the copy itself is not followed either.
+        os.symlink(str(outside), str(self.copy / 'planted'))
+        failed, text = self.call('read_file', path='planted/conf.txt')
+        self.assertTrue(failed)
+        self.assertIn('outside the repository', text)
 
     def test_partial_clone_has_no_history_tools(self):
         self.git(self.repo, 'config', 'extensions.partialclone', 'origin')
@@ -664,7 +1023,6 @@ class RepoToolsServer(Base):
         self.git(self.repo, 'config', 'blame.ignoreRevsFile', str(outside))
         self.git(self.repo, 'config', 'mailmap.file', str(outside))
         self.git(self.repo, 'config', 'diff.orderFile', str(outside))
-        self.git(self.repo, 'config', 'blame.ignoreRevsFile', str(outside))
         for arguments in ({'command': 'log'}, {'command': 'show'}, {'command': 'diff', 'rev': 'HEAD~1..HEAD'}):
             failed, text = self.call('git', **arguments)
             self.assertFalse(failed, arguments)
@@ -674,7 +1032,7 @@ class RepoToolsServer(Base):
         attempts = [
             ('read_file', {'path': '.env'}, 'credentials'),
             ('read_file', {'path': '../outside.txt'}, 'outside the repository'),
-            ('read_file', {'path': 'link_out'}, 'outside the repository'),
+            ('read_file', {'path': 'link_out'}, 'not in the review copy'),
             ('read_file', {'path': str(self.tmp / 'outside.txt')}, 'relative'),
             ('read_file', {'path': '.git/config'}, '.git'),
             ('read_file', {'path': 'blob.bin'}, 'binary'),
