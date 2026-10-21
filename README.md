@@ -115,12 +115,12 @@ Models, timeouts, permissions, what is sent, and troubleshooting are in
 [skills/xreview/references/setup.md](skills/xreview/references/setup.md).
 
 **HPC and container hosts.** Codex's sandbox cannot start on some of them
-(`bwrap: ... Operation not permitted`, or `unsupported host mount` when home is a
-bind mount). `doctor` reports this, and xreview never runs Codex without its
-sandbox. Instead, set `"codex": {"tools": false}` in that machine's
-`~/.config/xreview/config.json` for **diff-only** Codex reviews: Codex gets the
-diff, with whole changed functions, but no tools at all, and each review is
-labelled as such. Claude Code reviews need no sandbox and work there unchanged.
+(`bwrap: ... Operation not permitted`, or `unsupported host mount`). `doctor`
+reports this, and xreview never runs Codex without its sandbox. Instead, set
+`"codex": {"tools": "repo"}` in that machine's `~/.config/xreview/config.json`:
+Codex then has no shell and reads the repository through xreview's own read-only
+tools (list, read and search files, plus git history, confined to the repository). Claude
+Code reviews need no sandbox and work there unchanged.
 
 ## Get updates
 

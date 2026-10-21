@@ -299,6 +299,36 @@ class ReviewFlow(Base):
             self.assertIn(flag, args)
         self.assertIn('read-only', args)
 
+    def test_repo_mode_gives_codex_repo_tools_instead_of_a_shell(self):
+        self.write_config(codex={'bin': str(self.tmp / 'fakes/codex'), 'tools': 'repo'})
+        self.change()
+        code, out = self.xr('run', '--reviewer', 'codex')
+        self.assertEqual(code, 0, out)
+        self.assertIn('Repo-tools review', out)
+        self.assertIn('Mode: repo tools', out)
+        self.assertNotIn('diff only', out)
+        job = self.meta(self.job_id(out))
+        self.assertEqual(job['codex_mode'], 'repo')
+        args = self.calls()[-1]['args']
+        self.assertEqual(args[args.index('shell_tool') - 1], '--disable')
+        self.assertNotIn('code_mode_host', args)           # Codex calls MCP tools through code mode
+        server = [a for a in args if a.startswith('mcp_servers.xreview_repo.args=')]
+        self.assertEqual(len(server), 1)
+        server_args = json.loads(server[0].split('=', 1)[1])
+        self.assertEqual(server_args[1:], ['_repo_tools', str(self.repo.resolve())])
+        self.assertTrue(server_args[0].endswith('xreview.py'))
+        self.assertIn('--ignore-user-config', args)
+        prompt = (Path(job['job_dir']) / 'prompt.md').read_text()
+        self.assertIn('xreview_repo tools', prompt)
+
+    def test_switching_mode_is_a_new_review(self):
+        self.change()
+        self.xr('run', '--reviewer', 'codex')
+        self.write_config(codex={'bin': str(self.tmp / 'fakes/codex'), 'tools': 'repo'})
+        code, out = self.xr('run', '--reviewer', 'codex')
+        self.assertNotIn('already reviewed', out)
+        self.assertEqual(len(self.calls()), 2)
+
     def test_diff_only_applies_to_codex_only(self):
         self.diff_only_config()
         self.change()
@@ -454,7 +484,14 @@ class Guards(Base):
     def test_doctor_broken_sandbox_suggests_diff_only(self):
         code, out = self.xr('doctor', '--reviewer', 'codex', env={'FAKE_SANDBOX': 'broken'})
         self.assertEqual(code, 1, out)
-        self.assertIn('"codex": {"tools": false}', out)
+        self.assertIn('"codex": {"tools": "repo"}', out)
+
+    def test_doctor_broken_sandbox_ok_in_repo_mode(self):
+        self.write_config(codex={'bin': str(self.tmp / 'fakes/codex'), 'tools': 'repo'})
+        code, out = self.xr('doctor', '--reviewer', 'codex', env={'FAKE_SANDBOX': 'broken'})
+        self.assertEqual(code, 0, out)
+        self.assertIn('repo-tools mode is on', out)
+        self.assertIn("read-only repository tools respond", out)
 
     def test_doctor_broken_sandbox_ok_in_diff_only_mode(self):
         self.write_config(codex={'bin': str(self.tmp / 'fakes/codex'), 'tools': False})
@@ -467,13 +504,198 @@ class Guards(Base):
         self.change()
         code, out = self.xr('start', '--reviewer', 'codex')
         self.assertEqual(code, 1, out)
-        self.assertIn('must be true or false', out)
+        self.assertIn('must be true, "repo" or false', out)
 
     def test_doctor_with_fakes(self):
         code, out = self.xr('doctor')
         self.assertEqual(code, 0, out)
         self.assertIn('Codex read-only sandbox works', out)
         self.assertIn('Claude Code is logged in', out)
+
+
+class RepoToolsServer(Base):
+    """The MCP server Codex uses in repo mode: it must only ever read, inside the repo."""
+
+    def rpc(self, *requests, root=None):
+        lines = ''.join(json.dumps(r) + '\n' for r in requests)
+        proc = subprocess.run([sys.executable, str(SCRIPT), '_repo_tools', str(root or self.repo)], input=lines,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+        return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+
+    def call(self, name, **arguments):
+        reply = self.rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                          'params': {'name': name, 'arguments': arguments}})[0]['result']
+        return reply['isError'], reply['content'][0]['text']
+
+    def setUp(self):
+        super().setUp()
+        (self.repo / 'helpers.py').write_text('def helper():\n    return 42\n')
+        (self.repo / 'pkg').mkdir()
+        (self.repo / 'pkg' / 'mod.py').write_text('from helpers import helper\n' + 'x = 1\n' * 600)
+        self.git(self.repo, 'add', '.')
+        self.git(self.repo, 'commit', '-qm', 'more files')
+        (self.repo / 'new_untracked.py').write_text('NEW = helper()\n')
+        (self.repo / '.env').write_text('TOKEN=abc\n')
+        (self.repo / 'blob.bin').write_bytes(b'\x00\x01binary')
+        outside = self.tmp / 'outside.txt'
+        outside.write_text('outside secret\n')
+        os.symlink(str(outside), str(self.repo / 'link_out'))
+
+    def test_protocol(self):
+        replies = self.rpc(
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-11-25'}},
+            {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
+            {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
+            {'jsonrpc': '2.0', 'id': 3, 'method': 'ping'},
+            {'jsonrpc': '2.0', 'id': 4, 'method': 'resources/list'})
+        self.assertEqual([r['id'] for r in replies], [1, 2, 3, 4])      # no reply to the notification
+        self.assertEqual(replies[0]['result']['protocolVersion'], '2025-11-25')
+        self.assertEqual({t['name'] for t in replies[1]['result']['tools']}, {'read_file', 'list_files', 'search', 'git'})
+        self.assertTrue(all(t['annotations']['readOnlyHint'] for t in replies[1]['result']['tools']))
+        self.assertEqual(replies[3]['error']['code'], -32601)
+
+    def test_reading(self):
+        failed, text = self.call('read_file', path='helpers.py')
+        self.assertFalse(failed, text)
+        self.assertIn('2\t    return 42', text)
+        failed, text = self.call('read_file', path='pkg/mod.py', start_line=3, max_lines=5)
+        self.assertFalse(failed, text)
+        self.assertIn('call again with start_line=8', text)
+        failed, text = self.call('read_file', path='new_untracked.py')
+        self.assertFalse(failed, text)
+
+    def test_listing_and_search_skip_secrets(self):
+        failed, text = self.call('list_files')
+        self.assertFalse(failed, text)
+        self.assertIn('new_untracked.py', text)
+        self.assertIn('pkg/mod.py', text)
+        self.assertNotIn('.env', text)
+        failed, text = self.call('list_files', path='pkg', glob='*.py')
+        self.assertEqual(text.strip(), 'pkg/mod.py')
+        failed, text = self.call('search', pattern='helper')
+        self.assertIn('helpers.py:1:', text)
+        self.assertIn('pkg/mod.py:1:', text)
+        failed, text = self.call('search', pattern='TOKEN')
+        self.assertEqual(text, '(no matches)')
+        failed, text = self.call('search', pattern='(unclosed')
+        self.assertTrue(failed)
+
+    def test_git_history_commands(self):
+        for command in ('log', 'show'):
+            failed, text = self.call('git', command=command)
+            self.assertFalse(failed, command + ': ' + text)
+        failed, text = self.call('git', command='log', rev='HEAD~1..HEAD')
+        self.assertFalse(failed, text)
+        failed, text = self.call('git', command='diff', rev='HEAD~1..HEAD')
+        self.assertFalse(failed, text)
+        self.assertIn('+def helper():', text)
+        failed, text = self.call('git', command='show', path='helpers.py')
+        self.assertFalse(failed, text)
+        self.assertIn('return 42', text)
+        failed, text = self.call('git', command='blame', path='helpers.py')
+        self.assertTrue(failed)                                   # reads files named in local config
+        failed, text = self.call('git', command='diff')          # working tree: already in the prompt
+        self.assertTrue(failed)
+        self.assertIn('needs a range', text)
+        failed, text = self.call('git', command='status')
+        self.assertTrue(failed)
+
+    def test_git_filters_never_run(self):
+        # A clean filter configured for .py files would run if git touched the working tree.
+        marker = self.tmp / 'filter-ran'
+        self.git(self.repo, 'config', 'filter.marker.clean', "sh -c 'touch %s; cat'" % marker)
+        self.git(self.repo, 'config', 'diff.marker.textconv', "sh -c 'touch %s; cat \"$1\"' --" % marker)
+        (self.repo / '.gitattributes').write_text('*.py filter=marker diff=marker\n')
+        (self.repo / 'helpers.py').write_text('def helper():\n    return 43\n')
+        for name, arguments in (('git', {'command': 'log'}), ('git', {'command': 'show'}),
+                                ('git', {'command': 'diff', 'rev': 'HEAD~1..HEAD'}),
+                                ('search', {'pattern': 'helper'}), ('read_file', {'path': 'helpers.py'}),
+                                ('list_files', {})):
+            self.call(name, **arguments)
+        self.assertFalse(marker.exists(), 'a git filter ran inside the tool server')
+
+    def test_committed_secrets_stay_hidden(self):
+        (self.repo / '.env').write_text('TOKEN=s3cr3t-val\n')
+        self.git(self.repo, 'add', '-f', '.env')
+        self.git(self.repo, 'commit', '-qm', 'oops, a secret')
+        blob = subprocess.run(['git', '-C', str(self.repo), 'rev-parse', 'HEAD:.env'], stdout=subprocess.PIPE,
+                              universal_newlines=True).stdout.strip()
+        for arguments in ({'command': 'show'}, {'command': 'diff', 'rev': 'HEAD~1..HEAD'},
+                          {'command': 'log', 'rev': 'HEAD~1..HEAD'}):
+            failed, text = self.call('git', **arguments)
+            self.assertNotIn('s3cr3t-val', text, arguments)
+        for arguments in ({'command': 'show', 'rev': blob}, {'command': 'show', 'path': '.env'},
+                          {'command': 'diff', 'rev': 'HEAD~1..HEAD', 'path': '.env'}):
+            failed, text = self.call('git', **arguments)
+            self.assertTrue(failed, arguments)
+            self.assertNotIn('s3cr3t-val', text, arguments)
+
+    def test_search_does_not_follow_directory_links(self):
+        outside = self.tmp / 'outside-dir'
+        outside.mkdir()
+        (outside / 'conf.txt').write_text('needle outside the repository\n')
+        (self.repo / 'linked').mkdir()
+        (self.repo / 'linked' / 'conf.txt').write_text('needle inside\n')
+        self.git(self.repo, 'add', 'linked/conf.txt')
+        self.git(self.repo, 'commit', '-qm', 'tracked file under a directory')
+        import shutil as _shutil
+        _shutil.rmtree(str(self.repo / 'linked'))
+        os.symlink(str(outside), str(self.repo / 'linked'))       # the index still lists linked/conf.txt
+        os.symlink(str(self.repo / '.git'), str(self.repo / 'gitlink'))
+        failed, text = self.call('search', pattern='needle|repositoryformatversion')
+        self.assertNotIn('outside the repository', text)
+        self.assertNotIn('repositoryformatversion', text)
+        failed, text = self.call('read_file', path='linked/conf.txt')
+        self.assertTrue(failed)
+        failed, text = self.call('read_file', path='gitlink/config')
+        self.assertTrue(failed)
+
+    def test_partial_clone_has_no_history_tools(self):
+        self.git(self.repo, 'config', 'extensions.partialclone', 'origin')
+        failed, text = self.call('git', command='log')
+        self.assertTrue(failed)
+        self.assertIn('partial clone', text)
+        failed, text = self.call('read_file', path='helpers.py')
+        self.assertFalse(failed, text)
+
+    def test_local_git_config_cannot_point_outside(self):
+        outside = self.tmp / 'outside-secret.txt'
+        outside.write_text('zz-outside-marker-1\n<helper@example.com> zz-outside-marker-2\n')
+        self.git(self.repo, 'config', 'blame.ignoreRevsFile', str(outside))
+        self.git(self.repo, 'config', 'mailmap.file', str(outside))
+        self.git(self.repo, 'config', 'diff.orderFile', str(outside))
+        self.git(self.repo, 'config', 'blame.ignoreRevsFile', str(outside))
+        for arguments in ({'command': 'log'}, {'command': 'show'}, {'command': 'diff', 'rev': 'HEAD~1..HEAD'}):
+            failed, text = self.call('git', **arguments)
+            self.assertFalse(failed, arguments)
+            self.assertNotIn('zz-outside-marker', text, arguments)
+
+    def test_everything_outside_the_boundary_is_refused(self):
+        attempts = [
+            ('read_file', {'path': '.env'}, 'credentials'),
+            ('read_file', {'path': '../outside.txt'}, 'outside the repository'),
+            ('read_file', {'path': 'link_out'}, 'outside the repository'),
+            ('read_file', {'path': str(self.tmp / 'outside.txt')}, 'relative'),
+            ('read_file', {'path': '.git/config'}, '.git'),
+            ('read_file', {'path': 'blob.bin'}, 'binary'),
+            ('list_files', {'path': '..'}, 'outside the repository'),
+            ('search', {'pattern': 'x', 'path': '../'}, 'outside the repository'),
+            ('git', {'command': 'log', 'rev': '--output=/tmp/pwned'}, 'invalid revision'),
+            ('git', {'command': 'diff', 'path': '../outside.txt'}, 'outside the repository'),
+            ('git', {'command': 'show', 'path': '.git/config'}, 'outside the repository'),
+            ('git', {'command': 'show', 'rev': 'HEAD:helpers.py'}, 'invalid revision'),
+            ('git', {'command': 'show', 'path': '.env'}, 'credentials'),
+            ('git', {'command': 'blame', 'path': 'helpers.py'}, 'unsupported'),
+            ('git', {'command': 'push'}, 'unsupported'),
+            ('no_such_tool', {}, 'unknown tool'),
+        ]
+        for name, arguments, message in attempts:
+            with self.subTest(name=name, arguments=arguments):
+                failed, text = self.call(name, **arguments)
+                self.assertTrue(failed, text)
+                self.assertIn(message, text)
+        self.assertFalse(Path('/tmp/pwned').exists())
+        self.assertEqual((self.tmp / 'outside.txt').read_text(), 'outside secret\n')
 
 
 if __name__ == '__main__':

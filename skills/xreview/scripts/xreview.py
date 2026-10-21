@@ -27,14 +27,15 @@ import sys
 import tempfile
 import time
 
-VERSION = '0.3.1'
+VERSION = '0.4.0'
 REVIEWERS = ('codex', 'claude')
 NAMES = {'codex': 'Codex', 'claude': 'Claude Code'}
 DEFAULT_CONFIG = {
     'timeout_minutes': 30,
     'max_diff_kb': 300,
     # Reviewer defaults; set a field to null in the config file to use that CLI's own default.
-    # tools: false = diff-only Codex reviews, for hosts where Codex's sandbox cannot start.
+    # tools: true = Codex's sandboxed shell; "repo" = xreview's read-only repository
+    # tools, for hosts where Codex's sandbox cannot start; false = diff only.
     'codex': {'bin': None, 'model': 'gpt-6-astra', 'effort': 'medium', 'tools': True},
     'claude': {'bin': None, 'model': 'claude-opus-5-5', 'effort': 'high'},
 }
@@ -136,6 +137,10 @@ TOOL_NOTES = {
     'codex-diff-only': 'This run has no file or command tools: review only the notes and '
                        'the diff in this prompt (it shows whole changed functions), and '
                        'list in not_verified anything that depends on code outside it.',
+    'codex-repo': 'This run has no shell. Read code with the xreview_repo tools instead: '
+                  'list_files, read_file and search for current files, and git (log, show, '
+                  'diff between commits) for history, all limited to this repository. '
+                  'Open callers, helpers, tests and configs whenever the change depends on them.',
 }
 # Every Codex review: ignore ~/.codex/config.toml (the user's MCP servers, plugins
 # and hooks, some of which run code outside the sandbox) and turn off connected
@@ -147,13 +152,15 @@ CODEX_REVIEWER_FLAGS = [
     '--disable', 'multi_agent', '--disable', 'image_generation', '--disable', 'goals',
     '--disable', 'tool_suggest', '-c', 'web_search="disabled"',
 ]
-# Diff-only Codex reviewer: additionally no shell or code execution, so Codex never
-# needs its sandbox (which cannot start on some HPC hosts). apply_patch stays, but
-# the read-only policy still rejects every write.
-CODEX_DIFF_ONLY_FLAGS = [
-    '--disable', 'shell_tool', '--disable', 'unified_exec', '--disable', 'code_mode_host',
-    '--disable', 'view_image',
-]
+# Hosts where Codex's sandbox cannot start (some HPC login nodes) get no shell.
+# In "repo" mode Codex reads code through xreview's own read-only MCP server (see
+# RepoTools below); code mode stays on because Codex calls MCP tools through it,
+# and it can neither read files, use the network nor write by itself. In
+# diff-only mode code mode is off too, so Codex has no tools at all. apply_patch
+# stays in both, but the read-only policy rejects every write.
+CODEX_NO_SHELL_FLAGS = ['--disable', 'shell_tool', '--disable', 'unified_exec', '--disable', 'view_image']
+CODEX_DIFF_ONLY_FLAGS = CODEX_NO_SHELL_FLAGS + ['--disable', 'code_mode_host']
+REPO_TOOLS_SERVER = 'xreview_repo'
 
 class Fail(Exception):
     """A user-facing error; the message says what to do."""
@@ -200,13 +207,38 @@ def load_config():
         value = cfg.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             raise Fail('{} in {} must be a positive number'.format(key, path))
-    if not isinstance(cfg['codex'].get('tools', True), bool):
-        raise Fail('"codex": {{"tools": ...}} in {} must be true or false'.format(path))
+    tools = cfg['codex'].get('tools', True)
+    if not (isinstance(tools, bool) or tools == 'repo'):
+        raise Fail('"codex": {{"tools": ...}} in {} must be true, "repo" or false'.format(path))
     return cfg
 
 
+def codex_mode(reviewer, options):
+    """How a Codex reviewer reads code: 'shell' (its sandboxed shell), 'repo'
+    (xreview's read-only repository tools) or 'diff' (only the diff). None for Claude."""
+    if reviewer != 'codex':
+        return None
+    tools = options.get('tools', True)
+    return 'repo' if tools == 'repo' else 'diff' if tools is False else 'shell'
+
+
 def diff_only(reviewer, options):
-    return reviewer == 'codex' and options.get('tools') is False
+    return codex_mode(reviewer, options) == 'diff'
+
+
+def meta_mode(meta):
+    """The Codex mode a stored job ran with (older jobs only recorded diff_only)."""
+    if meta.get('reviewer') != 'codex':
+        return None
+    return meta.get('codex_mode') or ('diff' if meta.get('diff_only') else 'shell')
+
+
+def repo_tools_flags(repo):
+    """Codex config overrides that start xreview's read-only repository tools as an MCP server.
+    JSON strings and arrays are valid TOML, which is what -c expects."""
+    script = os.path.realpath(os.path.abspath(__file__))
+    return ['-c', 'mcp_servers.{}.command={}'.format(REPO_TOOLS_SERVER, json.dumps(sys.executable)),
+            '-c', 'mcp_servers.{}.args={}'.format(REPO_TOOLS_SERVER, json.dumps([script, '_repo_tools', str(repo)]))]
 
 
 def write_json(path, data):
@@ -414,21 +446,21 @@ def truncate_diff(diff, max_bytes, skipped):
 
 # ------------------------------------------------------------ building a job
 
-def build_prompt(reviewer, packet, repo, intent, project_rules, without_tools=False):
+def build_prompt(reviewer, packet, repo, intent, project_rules, mode=None):
     tag = secrets.token_hex(4)
     omitted = []
     if packet['hidden']:
         omitted.append('Not shown (possible credentials): ' + ', '.join(packet['hidden']))
     if packet['skipped']:
         omitted.append('Not inlined:\n' + '\n'.join('- ' + s for s in packet['skipped']))
-        if without_tools:
+        if mode == 'diff':
             omitted.append('You cannot open the files listed above in this run; name them in not_verified.')
     rules = ''
     if project_rules:
         rules = ('\nProject review instructions (from .xreview.md, written by the user):\n'
                  '<<<PROJECT-{0}\n{1}\nPROJECT-{0}>>>\n'.format(tag, project_rules.strip()))
     author = NAMES['claude' if reviewer == 'codex' else 'codex']
-    note = TOOL_NOTES['codex-diff-only' if without_tools else reviewer]
+    note = TOOL_NOTES[{'diff': 'codex-diff-only', 'repo': 'codex-repo'}.get(mode, reviewer)]
     return REVIEW_PROMPT.format(
         author=author, tool_note=note, project_rules=rules, tag=tag,
         intent=(intent or '(none given)').strip(), target=packet['target'], repo=repo,
@@ -448,8 +480,11 @@ def reviewer_command(reviewer, binary, options, repo, job):
             cmd += ['--model', model]
         if effort:
             cmd += ['-c', 'model_reasoning_effort=' + json.dumps(effort)]
-        if diff_only(reviewer, options):
+        mode = codex_mode(reviewer, options)
+        if mode == 'diff':
             cmd += CODEX_DIFF_ONLY_FLAGS
+        elif mode == 'repo':
+            cmd += CODEX_NO_SHELL_FLAGS + repo_tools_flags(repo)
         return cmd + ['-']
     # Claude Code: print mode, only file-reading tools confined to the repo,
     # no settings files, hooks, MCP servers, skills or saved session.
@@ -548,7 +583,8 @@ def cmd_start(args, wait_after=False):
     intent = args.intent
     if args.intent_file:
         intent = Path(args.intent_file).expanduser().read_text(encoding='utf-8')
-    without_tools = diff_only(reviewer, options)
+    mode = codex_mode(reviewer, options)
+    without_tools = mode == 'diff'
     packet = collect_changes(repo, args.base, int(cfg['max_diff_kb'] * 1024), function_context=without_tools)
     if not packet['diff'].strip() and not packet['skipped']:
         raise Fail('nothing to review: no changes {}. If the work is committed, pass '
@@ -561,8 +597,8 @@ def cmd_start(args, wait_after=False):
                 continue
             meta = refresh(meta)
             same = (meta.get('digest') == packet['digest'] and
-                    (meta.get('model'), meta.get('effort'), bool(meta.get('diff_only'))) ==
-                    (options.get('model'), options.get('effort'), without_tools))
+                    (meta.get('model'), meta.get('effort'), meta_mode(meta)) ==
+                    (options.get('model'), options.get('effort'), mode))
             if not same:
                 continue
             if meta.get('status') in ('queued', 'running'):
@@ -580,7 +616,7 @@ def cmd_start(args, wait_after=False):
     rules_file = repo / '.xreview.md'
     if rules_file.is_file():
         project_rules = rules_file.read_text(encoding='utf-8', errors='replace')
-    prompt = build_prompt(reviewer, packet, repo, intent, project_rules, without_tools=without_tools)
+    prompt = build_prompt(reviewer, packet, repo, intent, project_rules, mode=mode)
 
     created = now_utc()
     job_id = created.strftime('%Y%m%d-%H%M%S-') + secrets.token_hex(2)
@@ -598,6 +634,7 @@ def cmd_start(args, wait_after=False):
         'files_changed': packet['files_changed'], 'diff_bytes': packet['full_diff_bytes'],
         'hidden_files': packet['hidden'], 'not_inlined': packet['skipped'],
         'model': options.get('model'), 'effort': options.get('effort'), 'diff_only': without_tools,
+        'codex_mode': mode,
         'command': command, 'timeout_minutes': cfg['timeout_minutes'], 'created': iso(created),
     }
     write_json(job / 'meta.json', meta)
@@ -616,6 +653,9 @@ def cmd_start(args, wait_after=False):
         print('Not sent (look like credentials): ' + ', '.join(packet['hidden']))
     if without_tools:
         print('Diff-only review (this machine has "codex": {"tools": false}): the reviewer sees the diff but cannot open files.')
+    elif mode == 'repo':
+        print('Repo-tools review (this machine has "codex": {"tools": "repo"}): no shell; the reviewer reads '
+              'files through xreview\'s read-only repository tools.')
     if packet['skipped']:
         print('Not inlined: {} file(s); {}.'.format(
             len(packet['skipped']), 'a diff-only reviewer cannot see them' if without_tools
@@ -756,6 +796,9 @@ def render(meta, review):
     if meta.get('diff_only'):
         lines.append('- Mode: **diff only**: the reviewer saw the diff (whole changed functions) '
                      'but could not open other files on this machine')
+    elif meta_mode(meta) == 'repo':
+        lines.append('- Mode: repo tools: no shell; the reviewer read the repository through '
+                     'xreview\'s read-only tools')
     if review.get('note'):
         lines.append('- Note: ' + review['note'])
     if meta.get('hidden_files'):
@@ -981,21 +1024,32 @@ def cmd_doctor(args):
                 probe = run_quiet([binary, 'sandbox', '--', '/bin/sh', '-c',
                                    'echo read-ok; touch x 2>/dev/null && echo write-allowed || echo write-blocked'],
                                   cwd=tmp)
-            without_tools = diff_only(reviewer, options)
+            mode = codex_mode(reviewer, options)
             if 'read-ok' in probe and 'write-blocked' in probe:
                 print('  ok   Codex read-only sandbox works on this machine')
-                if without_tools:
-                    print('  WARN diff-only mode is on although the sandbox works; full reviews can also '
-                          'open files. Remove "tools": false from {} to use them.'.format(config_path()))
-            elif without_tools:
+                if mode != 'shell':
+                    print('  WARN "tools": {} is set although the sandbox works; full reviews also get a '
+                          'sandboxed shell. Remove it from {} to use them.'.format(json.dumps(options.get('tools')),
+                                                                                  config_path()))
+            elif mode == 'repo':
+                print('  ok   Codex sandbox cannot start here; repo-tools mode is on, so Codex reads files '
+                      'through xreview\'s read-only repository tools instead of a shell')
+            elif mode == 'diff':
                 print('  ok   Codex sandbox cannot start here; diff-only mode is on, so Codex reviews '
-                      'see the diff but cannot open files')
+                      'see the diff but cannot open files ("tools": "repo" gives them file access)')
             else:
                 print('  FAIL Codex read-only sandbox does not work here, so Codex reviews would fail. '
-                      'For diff-only reviews on this machine, add "codex": {{"tools": false}} to {}. '
-                      'Output: {}'.format(config_path(), probe.strip()[-300:] or 'none'))
+                      'Add "codex": {{"tools": "repo"}} to {} to review with xreview\'s read-only '
+                      'repository tools instead. Output: {}'.format(config_path(), probe.strip()[-300:] or 'none'))
                 ok = False
-            missing_host = None if without_tools else codex_missing_code_mode_host(binary)
+            if mode == 'repo':
+                problem = repo_tools_selftest()
+                if problem:
+                    print('  FAIL xreview\'s repository tools did not respond: ' + problem)
+                    ok = False
+                else:
+                    print('  ok   xreview\'s read-only repository tools respond')
+            missing_host = None if mode == 'diff' else codex_missing_code_mode_host(binary)
             if missing_host:
                 print('  WARN {} is missing next to the Codex binary, so this Codex may be unable to run '
                       'any commands. Reinstall Codex, or set "codex": {{"bin": ...}} to a complete '
@@ -1013,7 +1067,7 @@ def cmd_doctor(args):
                       'in a terminal on this machine.')
                 ok = False
         if args.live:
-            ok = live_check(reviewer, without_tools=diff_only(reviewer, options)) and ok
+            ok = live_check(reviewer, without_tools=diff_only(reviewer, cfg[reviewer])) and ok
     print('All checks passed.' if ok else 'Some checks failed; see above.')
     return EXIT_OK if ok else EXIT_ERROR
 
@@ -1102,6 +1156,279 @@ def live_check(reviewer, without_tools=False):
     return False
 
 
+# ------------------------------------------- read-only repository tools (MCP)
+#
+# For Codex reviews on hosts where its sandbox cannot start ("tools": "repo").
+# Codex starts `xreview.py _repo_tools <repo>` as an MCP stdio server and reads
+# code through it instead of a shell. This server is the safety boundary, so it
+# only ever reads: paths are confined to the repository (symlinks included), .git
+# and credential-like files are refused, output is capped, and the only command
+# it runs is git with fixed read-only subcommands and no pager, external diff,
+# textconv or fsmonitor. It never writes and never opens network connections.
+
+REPO_READ_LINES = 400
+REPO_MAX_FILE_BYTES = 2 * 1024 * 1024
+REPO_MAX_LIST = 500
+REPO_MAX_MATCHES = 200
+REPO_MAX_GIT_OUTPUT = 200 * 1024
+REV_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_./~^@{}-]*$')
+REPO_TOOLS = [
+    {'name': 'read_file',
+     'description': 'Read a text file in the repository, with line numbers.',
+     'inputSchema': {'type': 'object', 'properties': {
+         'path': {'type': 'string', 'description': 'Path relative to the repository root'},
+         'start_line': {'type': 'integer', 'description': 'First line to return (default 1)'},
+         'max_lines': {'type': 'integer', 'description': 'Lines to return (default and maximum 400)'}},
+         'required': ['path']}},
+    {'name': 'list_files',
+     'description': 'List files in the repository (tracked and untracked, respecting .gitignore).',
+     'inputSchema': {'type': 'object', 'properties': {
+         'path': {'type': 'string', 'description': 'Directory relative to the root (default: whole repository)'},
+         'glob': {'type': 'string', 'description': 'Optional filename pattern such as *.py'}}}},
+    {'name': 'search',
+     'description': 'Search text files for a regular expression; returns path:line: text.',
+     'inputSchema': {'type': 'object', 'properties': {
+         'pattern': {'type': 'string', 'description': 'Python regular expression'},
+         'path': {'type': 'string', 'description': 'Directory to search (default: whole repository)'},
+         'glob': {'type': 'string', 'description': 'Optional filename pattern such as *.py'}},
+         'required': ['pattern']}},
+    {'name': 'git',
+     'description': ('Read the repository history: log, show (one commit) or diff (between two commits). '
+                     'The uncommitted changes under review are already in your prompt; use read_file for '
+                     'current file contents.'),
+     'inputSchema': {'type': 'object', 'properties': {
+         'command': {'type': 'string', 'enum': ['log', 'show', 'diff']},
+         'rev': {'type': 'string', 'description': ('log: commit or range; show: one commit (default HEAD); '
+                                                   'diff: range A..B (required)')},
+         'path': {'type': 'string', 'description': 'Limit to this path'}},
+         'required': ['command']}},
+]
+for _tool in REPO_TOOLS:
+    _tool['annotations'] = {'readOnlyHint': True, 'openWorldHint': False}
+
+
+class ToolError(Exception):
+    pass
+
+
+class RepoTools:
+    def __init__(self, root):
+        self.root = Path(root).resolve()
+        # Partial clones fetch missing objects from their remote on demand: no history tools there.
+        self.partial = bool(self.git('config', '--get', 'extensions.partialclone').strip())
+
+    def _inside(self, full):
+        return full == self.root or self.root in full.parents
+
+    def resolve(self, rel, want_dir=False):
+        rel = (rel or '.').strip()
+        if os.path.isabs(rel):
+            raise ToolError('use a path relative to the repository root')
+        full = (self.root / rel).resolve()        # follows symlinks, so links out are caught here
+        if not self._inside(full):
+            raise ToolError('path is outside the repository')
+        if '.git' in full.relative_to(self.root).parts:
+            raise ToolError('the .git directory is not available')
+        if want_dir:
+            if not full.is_dir():
+                raise ToolError('not a directory: ' + rel)
+        else:
+            if is_secret_name(full.name):
+                raise ToolError('this file looks like it holds credentials; it is not available')
+            if not full.is_file():
+                raise ToolError('not a file: ' + rel)
+        return full
+
+    def git(self, *args):
+        # Only history commands run here (never the working tree), so no clean/smudge
+        # filter can start; every diff-producing call adds --no-ext-diff --no-textconv. User and system git config and GIT_* variables are ignored,
+        # and pagers, external diff, textconv, fsmonitor and signature checks are off.
+        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        env.update(GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0', GIT_NO_LAZY_FETCH='1',
+                   GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        # Repository-local config still loads, so override every setting that makes git
+        # read a file by path (which could point outside the repository).
+        cmd = ['git', '-C', str(self.root), '-c', 'core.pager=cat', '-c', 'core.fsmonitor=false',
+               '-c', 'diff.external=', '-c', 'log.showSignature=false', '-c', 'core.attributesFile=' + os.devnull,
+               '-c', 'log.mailmap=false', '-c', 'mailmap.file=' + os.devnull,
+               '-c', 'mailmap.blob=', '-c', 'diff.orderFile=' + os.devnull, '-c', 'core.excludesFile=' + os.devnull,
+               '--no-pager'] + list(args)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                              env=env, timeout=60)
+        return proc.stdout.decode('utf-8', 'replace')
+
+    def files(self, under=None):
+        names = [n for n in self.git('ls-files', '--cached', '--others', '--exclude-standard', '-z').split('\0') if n]
+        if under is not None and under != self.root:
+            prefix = str(under.relative_to(self.root)) + '/'
+            names = [n for n in names if n.startswith(prefix)]
+        return [n for n in names if not is_secret_name(n)]
+
+    def read_file(self, path, start_line=1, max_lines=REPO_READ_LINES):
+        full = self.resolve(path)
+        if full.stat().st_size > REPO_MAX_FILE_BYTES:
+            raise ToolError('file is larger than 2 MB')
+        data = full.read_bytes()
+        if looks_binary(data):
+            raise ToolError('binary file')
+        lines = data.decode('utf-8', 'replace').splitlines()
+        start = max(1, int(start_line or 1))
+        count = max(1, min(int(max_lines or REPO_READ_LINES), REPO_READ_LINES))
+        chunk = lines[start - 1:start - 1 + count]
+        body = '\n'.join('{:6}\t{}'.format(start + i, line) for i, line in enumerate(chunk))
+        more = len(lines) - (start - 1 + len(chunk))
+        if more > 0:
+            body += '\n... {} more lines; call again with start_line={}'.format(more, start + len(chunk))
+        return body or '(empty file)'
+
+    def list_files(self, path='.', glob=None):
+        import fnmatch
+        names = self.files(self.resolve(path, want_dir=True))
+        if glob:
+            names = [n for n in names if fnmatch.fnmatch(os.path.basename(n), glob)]
+        extra = '\n... {} more'.format(len(names) - REPO_MAX_LIST) if len(names) > REPO_MAX_LIST else ''
+        return '\n'.join(names[:REPO_MAX_LIST]) + extra if names else '(no files)'
+
+    def search(self, pattern, path='.', glob=None):
+        import fnmatch
+        try:
+            regex = re.compile(pattern)
+        except re.error as exc:
+            raise ToolError('invalid regular expression: {}'.format(exc))
+        hits = []
+        for name in self.files(self.resolve(path, want_dir=True)):
+            if glob and not fnmatch.fnmatch(os.path.basename(name), glob):
+                continue
+            try:
+                full = self.resolve(name)          # same confinement as read_file, per candidate
+                if full.stat().st_size > REPO_MAX_FILE_BYTES:
+                    continue
+                data = full.read_bytes()
+            except (ToolError, OSError):
+                continue
+            if looks_binary(data):
+                continue
+            for number, line in enumerate(data.decode('utf-8', 'replace').splitlines(), 1):
+                if regex.search(line):
+                    hits.append('{}:{}: {}'.format(name, number, line[:300]))
+                    if len(hits) >= REPO_MAX_MATCHES:
+                        return '\n'.join(hits) + '\n... stopped after {} matches'.format(REPO_MAX_MATCHES)
+        return '\n'.join(hits) or '(no matches)'
+
+    def commit(self, rev):
+        """A revision that must name a commit: blobs and trees could reveal any file."""
+        if not REV_RE.match(rev or ''):
+            raise ToolError('invalid revision')
+        out = self.git('rev-parse', '--verify', '--quiet', rev + '^{commit}').strip()
+        if not re.match(r'^[0-9a-f]{40,64}$', out):
+            raise ToolError('not a commit: ' + rev)
+        return out
+
+    def git_tool(self, command, rev=None, path=None):
+        if self.partial:
+            raise ToolError('history is not available in a partial clone (git could fetch over the network)')
+        tail = ['--', '.'] + secret_pathspecs()
+        if path:
+            target = (self.root / path).resolve()
+            if not self._inside(target) or '.git' in target.relative_to(self.root).parts:
+                raise ToolError('path is outside the repository')
+            if is_secret_name(target.name):
+                raise ToolError('this file looks like it holds credentials; it is not available')
+            tail = ['--', str(target.relative_to(self.root)) if target != self.root else '.'] + secret_pathspecs()
+        if command == 'log':
+            revs = []
+            if rev:
+                sides = re.split(r'\.\.\.?', rev, maxsplit=1)
+                revs = ['..'.join(self.commit(s) if s else 'HEAD' for s in sides)] if len(sides) == 2 else [self.commit(rev)]
+            args = ['log', '--no-color', '--no-ext-diff', '--no-textconv', '-n', '30', '--stat',
+                    '--date=short', '--format=%h %ad %an%n    %s'] + revs
+        elif command == 'show':
+            args = ['show', '--no-color', '--no-ext-diff', '--no-textconv', self.commit(rev or 'HEAD')]
+        elif command == 'diff':
+            sides = re.split(r'\.\.\.?', rev or '', maxsplit=1)
+            if len(sides) != 2:
+                raise ToolError('diff needs a range between commits, such as main..HEAD; the uncommitted '
+                                'changes are already in your prompt')
+            args = ['diff', '--no-color', '--no-ext-diff', '--no-textconv',
+                    self.commit(sides[0] or 'HEAD'), self.commit(sides[1] or 'HEAD')]
+        else:
+            # No blame: it reads blame.ignoreRevsFile from the repository's own config while
+            # starting up, before any override applies, and that path can point outside.
+            raise ToolError('unsupported git command (use log, show or diff)')
+        out = self.git(*(args + tail))
+        return out[:REPO_MAX_GIT_OUTPUT] + ('\n... output truncated' if len(out) > REPO_MAX_GIT_OUTPUT else '')
+
+    def call(self, name, arguments):
+        a = arguments if isinstance(arguments, dict) else {}
+        if name == 'read_file':
+            return self.read_file(a.get('path', ''), a.get('start_line', 1), a.get('max_lines', REPO_READ_LINES))
+        if name == 'list_files':
+            return self.list_files(a.get('path', '.'), a.get('glob'))
+        if name == 'search':
+            return self.search(str(a.get('pattern', '')), a.get('path', '.'), a.get('glob'))
+        if name == 'git':
+            return self.git_tool(a.get('command', ''), a.get('rev'), a.get('path'))
+        raise ToolError('unknown tool ' + str(name))
+
+
+def serve_repo_tools(root, stdin=None, stdout=None):
+    """Minimal MCP stdio server: newline-delimited JSON-RPC 2.0."""
+    stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
+    tools = RepoTools(root)
+    for line in stdin:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(msg, dict) or 'id' not in msg:
+            continue  # notifications (initialized, cancelled) need no answer
+        method, params = msg.get('method'), msg.get('params') or {}
+        reply = {'jsonrpc': '2.0', 'id': msg['id']}
+        if method == 'initialize':
+            reply['result'] = {'protocolVersion': params.get('protocolVersion') or '2025-06-18',
+                               'capabilities': {'tools': {}},
+                               'serverInfo': {'name': REPO_TOOLS_SERVER, 'version': VERSION}}
+        elif method == 'tools/list':
+            reply['result'] = {'tools': REPO_TOOLS}
+        elif method == 'tools/call':
+            try:
+                text, failed = tools.call(params.get('name'), params.get('arguments')), False
+            except (ToolError, OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
+                text, failed = 'error: {}'.format(exc), True
+            reply['result'] = {'content': [{'type': 'text', 'text': text}], 'isError': failed}
+        elif method == 'ping':
+            reply['result'] = {}
+        else:
+            reply['error'] = {'code': -32601, 'message': 'method not found'}
+        stdout.write(json.dumps(reply) + '\n')
+        stdout.flush()
+
+
+def repo_tools_selftest():
+    """Start the tool server like Codex would and read one file; None means it works."""
+    with tempfile.TemporaryDirectory() as tmp:
+        git(Path(tmp), 'init', '-q')
+        (Path(tmp) / 'probe.txt').write_text('xreview-probe\n', encoding='utf-8')
+        requests = [{'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-06-18'}},
+                    {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+                     'params': {'name': 'read_file', 'arguments': {'path': 'probe.txt'}}},
+                    {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call',
+                     'params': {'name': 'read_file', 'arguments': {'path': '../outside'}}}]
+        try:
+            proc = subprocess.run([sys.executable, os.path.realpath(os.path.abspath(__file__)), '_repo_tools', tmp],
+                                  input=''.join(json.dumps(r) + '\n' for r in requests).encode(),
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+            replies = [json.loads(line) for line in proc.stdout.decode('utf-8', 'replace').splitlines() if line.strip()]
+            read, outside = replies[1]['result'], replies[2]['result']
+        except (OSError, ValueError, KeyError, IndexError, subprocess.TimeoutExpired) as exc:
+            return 'no valid reply ({})'.format(exc)
+        if read['isError'] or 'xreview-probe' not in read['content'][0]['text']:
+            return 'could not read a test file'
+        if not outside['isError']:
+            return 'did not refuse a path outside the repository'
+    return None
+
+
 # ------------------------------------------------------------------ CLI
 
 def main(argv=None):
@@ -1135,6 +1462,8 @@ def main(argv=None):
     p.add_argument('--live', action='store_true', help='also run a tiny real review (uses quota)')
     p = sub.add_parser('_worker')
     p.add_argument('job_dir')
+    p = sub.add_parser('_repo_tools')
+    p.add_argument('root')
 
     args = parser.parse_args(argv)
     try:
@@ -1154,6 +1483,9 @@ def main(argv=None):
             return cmd_doctor(args)
         if args.command == '_worker':
             cmd_worker(args.job_dir)
+            return EXIT_OK
+        if args.command == '_repo_tools':
+            serve_repo_tools(args.root)
             return EXIT_OK
         parser.print_help()
         return EXIT_ERROR
