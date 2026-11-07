@@ -33,6 +33,11 @@ from this repository.
 - **Reviewer models:** Codex reviews with GPT-6 Astra at medium effort, and
   Claude Code with Opus 5.5 at high effort. Either can be changed per machine
   ([configuration](skills/xreview/references/setup.md#configuration)).
+- **Gemini on request.** `--reviewer gemini` has Gemini 4 Argon review instead,
+  through Google's Antigravity CLI (`agy`). It is never the default. Because agy
+  has no read-only mode, xreview confines it with a hook that allows only reading
+  the review copy and xreview's own read-only tools, and blocks everything else
+  ([details](skills/xreview/references/setup.md#what-the-reviewer-can-do)).
 - **Reviews run in the background**, so no agent's command timeout kills them.
   Answers must match a JSON schema. A crash, timeout, malformed answer or
   `cannot_review` is never treated as an approval.

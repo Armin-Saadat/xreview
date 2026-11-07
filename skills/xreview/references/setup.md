@@ -18,6 +18,10 @@
   workspace, the remote host, not the laptop).
 - Both agent CLIs installed and logged in there: `codex` (`codex login`) and
   `claude` (`claude auth login`). The desktop apps' sign-ins do not cover the CLIs.
+- Optional, for `--reviewer gemini`: Google's Antigravity CLI (`agy`), logged in by
+  running `agy` once in a terminal. It replaced the Gemini CLI for personal accounts in
+  June 2026. xreview looks for it on `PATH` and in `~/.gemini/bin`. Gemini reviews use
+  your Antigravity AI credits.
 - A git repository. To review a folder that is not one yet, run `git init` and
   commit a baseline first.
 
@@ -41,10 +45,16 @@ access and file reading together. It uses a little of each account's quota.
 | Codex, repo-tools mode (`"tools": "repo"`) | `codex exec --sandbox read-only ...`, plus `--disable shell_tool --disable unified_exec --disable view_image`, and xreview's own read-only tool server (`xreview.py _repo_tools <review copy> --git-dir <repo>/.git`) as its only MCP server | No shell. Reads the review copy through `list_files`, `read_file` and `search`, and history through `git` (log, show, diff between commits), with no `.git` internals, credential-like or private paths (also not in git output). Git runs against the git directory only, never a working tree, so no git filters run; it ignores your global and system git config, and settings that would make it read files by path are overridden. No writes, no network |
 | Codex, diff-only mode (`"tools": false`) | `codex exec --sandbox read-only ...`, plus `--disable shell_tool --disable unified_exec --disable code_mode_host --disable view_image` | No shell or files either: only the diff in the prompt, with whole changed functions. Writes are still rejected by the read-only policy |
 | Claude Code | `claude -p --restricted --tools Read,Grep,Glob --strict-mcp-config --permission-mode dontAsk --no-session-persistence --disable-slash-commands --json-schema ...`, run in the review copy | Read, Grep and Glob inside the review copy only (`--restricted` refuses paths outside the working directory); no shell, settings files, hooks, plugins or MCP servers |
+| Gemini (`--reviewer gemini`) | `agy --input-format stream-json --output-format stream-json --json-schema ... --settings {...} --sandbox --disable-slash-commands`, run in the review copy, with the prompt on stdin | `read_file` inside the review copy (plain absolute paths only, so that nothing agy might expand or decode can point elsewhere), and xreview's read-only tools (`list_files`, `search`, `read_file`, `git` history) as its only MCP server. Everything else is blocked by a gate: a `PreToolUse` hook xreview places in the copy's `.agents` folder, which denies every other tool (shell, edits, web search, scheduling, messages, subagents, other MCP servers) and every read outside the copy; a failing hook blocks the tool too. Session settings add deny rules for commands, writes and URLs, and agy's terminal sandbox. The repository's own agent configuration folders (`.agents`, `.agent`, `_agents`, `_agent`, `.gemini`) are left out of the copy, because agy loads and runs the hooks and MCP servers it finds there |
 
-Both run in a fresh session with `XREVIEW_ROLE=reviewer`, which stops xreview from
-starting a nested review. Neither can review its own work: xreview refuses
-`--reviewer claude` inside Claude Code and `--reviewer codex` inside Codex.
+All run in a fresh session with `XREVIEW_ROLE=reviewer`, which stops xreview from
+starting a nested review. None can review its own work: xreview refuses
+`--reviewer claude` inside Claude Code, `--reviewer codex` inside Codex and
+`--reviewer gemini` inside agy, where the default reviewer is Codex.
+
+agy has no option to ignore your own agy configuration, so Gemini reviews still load
+your global agy hooks and plugins (in `~/.gemini/config`), and are saved in your agy
+conversation history.
 
 ## What the reviewer can read
 
@@ -106,6 +116,7 @@ Reviewers use these models unless you configure others:
 |---|---|---|
 | Codex | `gpt-6-astra` | `medium` |
 | Claude Code | `claude-opus-5-5` (Opus 5.5) | `high` |
+| Gemini, only with `--reviewer gemini` | `gemini-4-argon` (Gemini 4 Argon) | `high` |
 
 To change them on one machine, create `~/.config/xreview/config.json` (or the
 path in `XREVIEW_CONFIG`) with only the fields you want to change:
@@ -115,9 +126,13 @@ path in `XREVIEW_CONFIG`) with only the fields you want to change:
   "timeout_minutes": 30,
   "max_diff_kb": 300,
   "codex":  {"model": "gpt-6-astra", "effort": "medium"},
-  "claude": {"model": "claude-opus-5-5", "effort": "high"}
+  "claude": {"model": "claude-opus-5-5", "effort": "high"},
+  "gemini": {"model": "gemini-4-argon", "effort": "high"}
 }
 ```
+
+For Gemini, `model` is a base name from `agy models` without the effort suffix
+(`gemini-4-argon`, not `gemini-4-argon-high`); agy refuses the two together.
 
 - Set `model` or `effort` to `null` to use that CLI's built-in default instead.
   Codex reviews ignore your `~/.codex/config.toml` (so that none of your MCP servers,
@@ -181,6 +196,9 @@ first 64 KB. Use it for invariants a reviewer cannot infer, for example:
 | `Codex could not confine its shell to the review copy`, or `doctor` says it `cannot keep its shell inside the review copy` | xreview runs Codex's shell only under a permission profile that can read the copy alone, and never falls back to Codex's plain sandbox, which reads every file you can. Profiles need Codex 0.138 or later, so upgrade Codex; if that is not possible, use `"tools": "repo"` |
 | `fs sandbox helper failed` | Codex re-runs its own binary inside the profile, and could not read it. Point `"codex": {"bin": ...}` at the native Codex binary rather than a wrapper script, or use `"tools": "repo"` |
 | `.xreview.json is not valid JSON`, `unknown key`, `negated patterns are not supported` | Fix `.xreview.json`; xreview will not review without knowing what is private |
+| Gemini: `the Antigravity CLI is not logged in`, or `authentication failed` | Run `agy` once in a terminal on that machine and finish the Google sign-in |
+| Gemini: `Your AI credits balance is too low to continue` | The Antigravity account is out of AI credits. Wait for them to refill, or choose a cheaper model such as `"gemini": {"model": "gemini-3.8-flash"}` |
+| Gemini: `the Gemini review gate failed its check` | The hook that keeps agy read-only could not run (for example the Python that runs xreview moved), so the review did not start. `doctor --reviewer gemini` shows why |
 | `running inside the Codex sandbox` | Re-run `start` with escalated permissions |
 | `Operation not permitted` writing `~/.local/share/xreview` | The shell is sandboxed; run `start` outside the sandbox |
 | `nothing to review` | No changes against HEAD; for committed work pass `--base <branch-or-commit>` |

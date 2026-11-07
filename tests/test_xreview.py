@@ -16,10 +16,10 @@ _spec = importlib.util.spec_from_file_location('xreview_module', str(SCRIPT))
 xreview = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(xreview)
 
-# One fake handles both CLIs. FAKE_MODE picks the behaviour.
+# One fake handles all three CLIs (codex, claude and agy for Gemini). FAKE_MODE picks the behaviour.
 FAKE = textwrap.dedent('''\
     #!{python}
-    import json, os, sys, time
+    import json, os, subprocess, sys, time
     args = sys.argv[1:]
     name = os.path.basename(sys.argv[0])
     log = os.environ.get('FAKE_LOG')
@@ -37,13 +37,48 @@ FAKE = textwrap.dedent('''\
         print('write-blocked'); sys.exit(0)
     if args[:2] == ['features', 'list']:
         print('shell_tool  stable  true'); sys.exit(0)
+    if args[:1] == ['models']:
+        if os.environ.get('FAKE_AGY_LOGIN') == 'no':
+            print('Authentication required.'); sys.exit(1)
+        print('gemini-4-argon-high\\tGemini 4 Argon (High)'); print('gemini-3.8-flash-low\\tGemini 3.8 Flash (Low)')
+        sys.exit(0)
     prompt = sys.stdin.read()
+    extra = {{}}
+    if name == 'agy':
+        # Stream mode: one NDJSON user event on stdin.
+        event = json.loads(prompt.splitlines()[0])
+        prompt = event['message']['content']
+        extra['stdin_event'] = event.get('event')
+        hooks = os.path.join(os.getcwd(), '.agents', 'hooks.json')
+        if os.path.exists(hooks):
+            command = json.load(open(hooks))['xreview-gate']['PreToolUse'][0]['hooks'][0]['command']
+            calls = {{'inside': ('read_file', {{'Path': os.path.join(os.getcwd(), 'stats.py')}}),
+                     'relative': ('read_file', {{'Path': 'stats.py'}}),
+                     'home': ('read_file', {{'Path': '~/.ssh/id_rsa'}}),
+                     'outside': ('read_file', {{'Path': '/etc/hosts'}}),
+                     'escape': ('read_file', {{'Path': os.path.join(os.getcwd(), '..', '..', 'meta.json')}}),
+                     'plumbing': ('read_file', {{'Path': os.path.join(os.getcwd(), '.agents', 'hooks.json')}}),
+                     'web': ('search_web', {{'query': 'x'}}),
+                     'shell': ('run_command', {{'CommandLine': 'touch x'}}),
+                     'mcp': ('call_mcp_tool', {{'ServerName': 'xreview_repo', 'ToolName': 'list_files', 'Arguments': {{}}}}),
+                     'other_mcp': ('call_mcp_tool', {{'ServerName': 'mail', 'ToolName': 'send', 'Arguments': {{}}}}),
+                     'finish': ('finish', {{'verdict': 'approve'}})}}
+            gate = {{}}
+            for key, (tool, tool_args) in calls.items():
+                payload = json.dumps({{'toolCall': {{'name': tool, 'args': tool_args}}}}).encode()
+                out = subprocess.run(['/bin/sh', '-c', command], input=payload, stdout=subprocess.PIPE,
+                                     cwd=os.path.dirname(hooks)).stdout.decode()
+                gate[key] = json.loads(out)['decision']
+            extra['gate'] = gate
+            extra['mcp_config'] = json.load(open(os.path.join(os.getcwd(), '.agents', 'mcp_config.json')))
     if log:
         files = sorted(os.path.relpath(os.path.join(d, n), os.getcwd())
                        for d, _, names in os.walk(os.getcwd()) for n in names)
+        record = {{'args': args, 'role': os.environ.get('XREVIEW_ROLE'), 'cwd': os.getcwd(),
+                  'files': files, 'pid': os.getpid(), 'prompt_len': len(prompt)}}
+        record.update(extra)
         with open(log, 'a') as f:
-            f.write(json.dumps({{'args': args, 'role': os.environ.get('XREVIEW_ROLE'), 'cwd': os.getcwd(),
-                                 'files': files, 'pid': os.getpid(), 'prompt_len': len(prompt)}}) + '\\n')
+            f.write(json.dumps(record) + '\\n')
     mode = os.environ.get('FAKE_MODE', 'approve')
     if mode.startswith('sleep'):
         time.sleep(float(mode[5:] or 30))
@@ -66,7 +101,21 @@ FAKE = textwrap.dedent('''\
                   'blockers': ['auth bypass']}},
     }}.get(mode)
     text = 'this is not json' if mode == 'badjson' else json.dumps(review)
-    if name == 'codex':
+    if name == 'agy':
+        if mode == 'credits':
+            sys.stderr.write('Error: Your AI credits balance is too low to continue.\\n')
+            print(json.dumps({{'event': 'result', 'result': {{'status': 'ERROR', 'response': '',
+                                                             'error': 'RESOURCE_EXHAUSTED (code 429)'}}}}))
+            sys.exit(1)
+        model = args[args.index('--model') + 1] if '--model' in args else 'default'
+        print(json.dumps({{'event': 'init', 'init': {{'model': model}}}}))
+        result = {{'status': 'SUCCESS', 'response': '' if mode == 'noanswer' else text}}
+        if mode not in ('badjson', 'noanswer'):
+            result['structured_output'] = review
+        if mode == 'noanswer':
+            sys.stderr.write('jetski: no output produced\\n')
+        print(json.dumps({{'event': 'result', 'result': result}}))
+    elif name == 'codex':
         out = args[args.index('--output-last-message') + 1]
         with open(out, 'w') as f:
             f.write(text)
@@ -86,7 +135,7 @@ class Base(unittest.TestCase):
         self.home.mkdir()
         fakes = self.tmp / 'fakes'
         fakes.mkdir()
-        for name in ('codex', 'claude'):
+        for name in ('codex', 'claude', 'agy'):
             path = fakes / name
             path.write_text(FAKE.format(python=sys.executable))
             path.chmod(0o755)
@@ -102,7 +151,8 @@ class Base(unittest.TestCase):
 
     def write_config(self, **extra):
         cfg = {'codex': {'bin': str(self.tmp / 'fakes/codex')},
-               'claude': {'bin': str(self.tmp / 'fakes/claude')}}
+               'claude': {'bin': str(self.tmp / 'fakes/claude')},
+               'gemini': {'bin': str(self.tmp / 'fakes/agy')}}
         cfg.update(extra)
         self.config.write_text(json.dumps(cfg))
 
@@ -758,6 +808,212 @@ class ReviewScope(Base):
         self.assertIn('cannot keep its shell inside the review copy', out)
 
 
+class GeminiReviewer(Base):
+    """Optional third reviewer: Gemini through the Antigravity CLI (agy), confined by xreview's gate."""
+
+    def prompt(self, out):
+        return (Path(self.meta(self.job_id(out))['job_dir']) / 'prompt.md').read_text()
+
+    def test_gemini_reviews_only_when_asked(self):
+        self.change()
+        code, out = self.xr('run', env={'CLAUDECODE': '1'})
+        self.assertEqual(code, 0, out)
+        self.assertIn('Codex review', out)                       # the default stays Codex
+        code, out = self.xr('run', '--reviewer', 'gemini', env={'CLAUDECODE': '1'})
+        self.assertEqual(code, 0, out)
+        self.assertIn('Gemini review', out)
+        self.assertIn('Model: gemini-4-argon', out)
+        self.assertIn('Another AI coding agent (Claude Code) wrote', self.prompt(out))
+        code, out = self.xr('run', '--reviewer', 'gemini', '--force')
+        self.assertIn('Another AI coding agent wrote', self.prompt(out))   # author unknown
+
+    def test_gemini_command_and_settings(self):
+        self.change()
+        code, out = self.xr('run', '--reviewer', 'gemini')
+        self.assertEqual(code, 0, out)
+        call = self.calls()[-1]
+        args = call['args']
+        self.assertEqual(call['stdin_event'], 'user')            # the prompt goes in on stdin
+        self.assertGreater(call['prompt_len'], 1000)
+        for flag in ('--sandbox', '--disable-slash-commands', '--json-schema'):
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index('--input-format') + 1], 'stream-json')
+        self.assertEqual(args[args.index('--output-format') + 1], 'stream-json')
+        self.assertEqual(args[args.index('--model') + 1], 'gemini-4-argon')
+        self.assertEqual(args[args.index('--effort') + 1], 'high')
+        self.assertNotIn('--dangerously-skip-permissions', args)
+        settings = json.loads(args[args.index('--settings') + 1])
+        tree = os.path.realpath(call['cwd'])
+        self.assertEqual(settings['permissions']['deny'], ['command(*)', 'write_file(*)', 'read_url(*)', 'execute_url(*)'])
+        self.assertIn('read_file({})'.format(tree), settings['permissions']['allow'])
+        self.assertIn('mcp(xreview_repo/search)', settings['permissions']['allow'])
+        self.assertFalse(settings['allowNonWorkspaceAccess'])
+        self.assertTrue(settings['enableTerminalSandbox'])
+        self.assertEqual(settings['toolPermission'], 'request-review')
+        self.assertFalse(Path(call['cwd']).exists())               # the copy is deleted afterwards
+
+    def test_gemini_copy_drops_repository_agent_config_and_gates_tools(self):
+        marker = self.tmp / 'repo-hook-ran'
+        (self.repo / '.agents').mkdir()
+        (self.repo / '.agents' / 'hooks.json').write_text(json.dumps({'evil': {'SessionStart': [
+            {'type': 'command', 'command': 'touch %s' % marker}]}}))
+        (self.repo / '.gemini').mkdir()
+        (self.repo / '.gemini' / 'settings.json').write_text('{}')
+        (self.repo / 'tools' / '_agents').mkdir(parents=True)
+        (self.repo / 'tools' / '_agents' / 'mcp_config.json').write_text('{}')
+        (self.repo / 'docs' / '.Agent').mkdir(parents=True)                # other spellings count too
+        (self.repo / 'docs' / '.Agent' / 'hooks.json').write_text('{}')
+        (self.repo / '_agent').write_text('a file named like one\n')
+        os.symlink('tools/_agents/mcp_config.json', str(self.repo / 'mcp.json'))   # no way back in by a link
+        self.git(self.repo, 'add', '.')
+        self.git(self.repo, 'commit', '-qm', 'agent configs')
+        self.change()
+        code, out = self.xr('run', '--reviewer', 'gemini')
+        self.assertEqual(code, 0, out)
+        call = self.calls()[-1]
+        self.assertEqual(sorted(call['files']), ['.agents/hooks.json', '.agents/mcp_config.json', 'stats.py'])
+        self.assertEqual(call['gate'], {'inside': 'allow', 'relative': 'deny', 'home': 'deny', 'outside': 'deny',
+                                        'escape': 'deny', 'plumbing': 'deny', 'web': 'deny', 'shell': 'deny',
+                                        'mcp': 'allow', 'other_mcp': 'deny', 'finish': 'allow'})
+        server = call['mcp_config']['mcpServers']['xreview_repo']
+        self.assertEqual(server['args'][1], '_repo_tools')
+        self.assertEqual(os.path.realpath(server['args'][2]), os.path.realpath(call['cwd']))
+        self.assertIn('--git-dir', server['args'])
+        self.assertIn('agent configuration folders', self.prompt(out))
+        self.assertFalse(marker.exists())
+        # The other reviewers still see those folders.
+        code, out = self.xr('run', '--reviewer', 'claude')
+        self.assertIn('.gemini/settings.json', self.calls()[-1]['files'])
+
+    def test_files_named_like_agent_config_do_not_break_gemini_reviews(self):
+        # A root file named .agents would block xreview's own folder; '#' sorts first and is a
+        # name the gate refuses, which must not fail the gate's own check.
+        (self.repo / '.agents').write_text('not a folder\n')
+        (self.repo / '#notes.md').write_text('notes\n')
+        self.git(self.repo, 'add', '.')
+        self.git(self.repo, 'commit', '-qm', 'odd names')
+        self.change()
+        code, out = self.xr('run', '--reviewer', 'gemini')
+        self.assertEqual(code, 0, out)
+        call = self.calls()[-1]
+        self.assertEqual(sorted(call['files']), ['#notes.md', '.agents/hooks.json', '.agents/mcp_config.json',
+                                                 'stats.py'])
+
+    def test_gemini_failures_are_not_approvals(self):
+        self.change()
+        for mode, message in (('badjson', 'not valid JSON'), ('noanswer', 'without an answer'),
+                              ('credits', 'credits balance is too low'), ('exit1', 'boom')):
+            code, out = self.xr('run', '--reviewer', 'gemini', '--force', env={'FAKE_MODE': mode})
+            self.assertEqual(code, 1, mode + ': ' + out)
+            self.assertIn('FAILED', out)
+            self.assertIn(message, out)
+
+    def test_gemini_author_is_detected(self):
+        self.change()
+        env = {'ANTIGRAVITY_CONVERSATION_ID': 'abc'}
+        code, out = self.xr('start', '--reviewer', 'gemini', env=env)
+        self.assertEqual(code, 1, out)
+        self.assertIn('Gemini cannot review its own work; use --reviewer codex or --reviewer claude', out)
+        code, out = self.xr('run', env=env)
+        self.assertEqual(code, 0, out)
+        self.assertIn('Codex review', out)
+        self.assertIn('Another AI coding agent (Gemini) wrote', self.prompt(out))
+
+    def test_broken_gate_stops_the_review(self):
+        self.change()
+        code, out = self.xr('start', '--reviewer', 'gemini')
+        job = Path(self.meta(self.job_id(out))['job_dir'])
+        self.xr('wait', self.job_id(out), '--timeout', '60')
+        # A gate that cannot run must keep agy from starting at all.
+        tree = self.tmp / 'gate-tree'
+        tree.mkdir()
+        (tree / 'a.py').write_text('x = 1\n')
+        self.assertIsNone(xreview.agy_gate_problem(tree))
+        original = xreview.agy_gate_command
+        try:
+            xreview.agy_gate_command = lambda root: 'exit 3'
+            self.assertIn('did not answer', xreview.agy_gate_problem(tree))
+        finally:
+            xreview.agy_gate_command = original
+        self.assertTrue(job.exists())
+
+    def test_gate_decisions(self):
+        root = self.tmp / 'copy'
+        (root / 'pkg').mkdir(parents=True)
+        (root / 'pkg' / 'mod.py').write_text('x = 1\n')
+        (root / '.env').write_text('A=1\n')
+        os.symlink(str(self.tmp), str(root / 'up'))
+        mod = str(root / 'pkg' / 'mod.py')
+        cases = [
+            (('read_file', {'Path': mod}), 'allow'),
+            (('read_file', {'Path': mod, 'StartLine': '1', 'EndLine': '800'}), 'allow'),
+            (('read_file', {'Path': 'file://' + mod}), 'allow'),
+            (('read_file', {'Path': 'FILE://' + mod}), 'allow'),
+            (('read_file', {'Path': str(root / 'pkg' / '..' / 'pkg' / 'mod.py')}), 'allow'),
+            (('read_file', {'Path': 'pkg/mod.py'}), 'deny'),       # relative: agy could resolve it elsewhere
+            (('read_file', {'Path': str(root / 'up' / 'config.json')}), 'deny'),   # a symlink out of the copy
+            (('read_file', {'Path': str(root / '.env')}), 'deny'),
+            (('read_file', {'Path': ''}), 'deny'),
+            (('read_file', {}), 'deny'),
+            (('read_file', {'Path': str(root / '.git' / 'config')}), 'deny'),
+            (('read_file', {'Path': str(root / '.AGENTS' / 'mcp_config.json')}), 'deny'),  # case-insensitive FS
+            (('read_file', {'Path': str(root / 'pkg' / '.Gemini' / 'settings.json')}), 'deny'),
+            (('read_file', {'Path': str(root / '.ENV')}), 'deny'),
+            # Paths agy might expand or decode into something other than what the gate checked.
+            (('read_file', {'Path': '~/.ssh/id_rsa'}), 'deny'),
+            (('read_file', {'Path': '$HOME/.ssh/id_rsa'}), 'deny'),
+            (('read_file', {'Path': str(root) + '/$HOME'}), 'deny'),
+            (('read_file', {'Path': 'file://localhost/etc/hosts'}), 'deny'),
+            (('read_file', {'Path': 'file:/etc/hosts'}), 'deny'),
+            (('read_file', {'Path': 'file://' + str(root) + '/%2e%2e/%2e%2e/etc/hosts'}), 'deny'),
+            (('read_file', {'Path': '/etc/hosts#/../..' + mod}), 'deny'),      # a fragment would cut it short
+            (('read_file', {'Path': '/etc/hosts?/../..' + mod}), 'deny'),
+            (('read_file', {'Path': str(root) + '\\..\\..\\etc\\hosts'}), 'deny'),
+            (('read_file', {'Path': ' ' + mod}), 'deny'),
+            (('read_file', {'Path': mod + '\n'}), 'deny'),
+            (('read_file', {'Path': mod, 'Paths': ['/etc/hosts']}), 'deny'),    # arguments it does not know
+            (('call_mcp_tool', {'ServerName': 'xreview_repo', 'ToolName': 'git'}), 'allow'),
+            (('call_mcp_tool', {'ServerName': 'xreview_repo', 'ToolName': 'git', 'Arguments': {}}), 'allow'),
+            (('call_mcp_tool', {'ServerName': 'xreview_repo', 'ToolName': 'git', 'Server': 'mail'}), 'deny'),
+            (('call_mcp_tool', {'ServerName': 'xreview_repo', 'ToolName': 'write'}), 'deny'),
+            (('edit_file', {'Path': 'pkg/mod.py'}), 'deny'),
+            (('write_file', {'Path': 'pkg/new.py'}), 'deny'),
+            (('schedule', {}), 'deny'),
+            (('invoke_subagent', {}), 'deny'),
+            (('send_message', {}), 'deny'),
+            (('read_url_content', {'Url': 'https://example.com'}), 'deny'),
+        ]
+        for (tool, args), expected in cases:
+            with self.subTest(tool=tool, args=args):
+                payload = json.dumps({'toolCall': {'name': tool, 'args': args}})
+                proc = subprocess.run([sys.executable, str(SCRIPT), '_agy_gate', str(root)], input=payload,
+                                      stdout=subprocess.PIPE, universal_newlines=True, timeout=60)
+                self.assertEqual(json.loads(proc.stdout)['decision'], expected)
+        for junk in ('not json', '[]', '{}', '{"toolCall": "read_file"}'):
+            proc = subprocess.run([sys.executable, str(SCRIPT), '_agy_gate', str(root)], input=junk,
+                                  stdout=subprocess.PIPE, universal_newlines=True, timeout=60)
+            self.assertEqual(json.loads(proc.stdout)['decision'], 'deny', junk)
+
+    def test_doctor_treats_gemini_as_optional(self):
+        agy = self.tmp / 'fakes' / 'agy'
+        agy.rename(self.tmp / 'agy-away')                          # no agy anywhere
+        self.write_config(gemini={'bin': None})
+        code, out = self.xr('doctor')
+        self.assertEqual(code, 0, out)
+        self.assertIn('not set up (optional; needed only for --reviewer gemini)', out)
+        code, out = self.xr('doctor', '--reviewer', 'gemini')
+        self.assertEqual(code, 1, out)                             # asked for explicitly: a failure
+        (self.tmp / 'agy-away').rename(agy)
+        self.write_config()
+        code, out = self.xr('doctor', '--reviewer', 'gemini')
+        self.assertEqual(code, 0, out)
+        self.assertIn('Antigravity CLI is logged in', out)
+        self.assertIn('the gate that keeps Gemini reviews read-only works', out)
+        code, out = self.xr('doctor', '--reviewer', 'gemini', env={'FAKE_AGY_LOGIN': 'no'})
+        self.assertEqual(code, 1, out)
+        self.assertIn('not logged in', out)
+
+
 class PathPatterns(unittest.TestCase):
     """.xreview.json patterns follow .gitignore rules; check them against git itself."""
 
@@ -981,6 +1237,22 @@ class RepoToolsServer(Base):
             failed, text = self.call('git', **arguments)
             self.assertTrue(failed, arguments)
             self.assertNotIn('s3cr3t-val', text, arguments)
+
+    def test_committed_secrets_with_uppercase_names_stay_hidden(self):
+        (self.repo / 'keys').mkdir()
+        (self.repo / 'keys' / 'SERVER.PEM').write_text('PEM-s3cr3t-val\n')
+        (self.repo / 'keys' / 'Deploy.Key').write_text('KEY-s3cr3t-val\n')
+        self.git(self.repo, 'add', '-f', 'keys')
+        self.git(self.repo, 'commit', '-qm', 'oops, keys')
+        self.make_copy()
+        self.assertFalse((self.copy / 'keys').exists())
+        for arguments in ({'command': 'show'}, {'command': 'diff', 'rev': 'HEAD~1..HEAD'},
+                          {'command': 'log', 'rev': 'HEAD~1..HEAD'}, {'command': 'show', 'path': 'keys'}):
+            failed, text = self.call('git', **arguments)
+            self.assertNotIn('s3cr3t-val', text, arguments)
+            self.assertNotIn('SERVER.PEM', text, arguments)
+        failed, text = self.call('read_file', path='keys/SERVER.PEM')
+        self.assertTrue(failed)
 
     def test_copy_does_not_follow_directory_links(self):
         outside = self.tmp / 'outside-dir'

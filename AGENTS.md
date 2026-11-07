@@ -52,6 +52,10 @@ into projects that install the plugin.
   credential-like and `private` paths, plus committed `readable` ones), never the
   repository itself: whatever a reviewer reads goes to its provider. Codex's shell
   must stay under the permission profile that confines its reads to that copy.
+- Gemini reviews (agy) must keep xreview's PreToolUse gate in the copy's `.agents`
+  folder, and the repository's own agent configuration folders out of it: agy runs
+  workspace hooks and MCP servers without asking. The gate allows only reads inside
+  the copy, xreview's repository tools and the final answer; anything new denies.
 - Never print or send credentials. Extend `SECRET_GLOBS` rather than special-casing.
 - Every behaviour change gets a test in `tests/test_xreview.py`. Use the fake CLI
   (`FAKE_MODE`) rather than real model calls.

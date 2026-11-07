@@ -31,6 +31,9 @@ the user asks; skip when they say so.
    - The reviewer defaults to the other agent. xreview collects the diff from git
      itself (staged, unstaged and untracked files), so do not paste code into
      `--intent`.
+   - Gemini can review instead when the user asks for it: add `--reviewer gemini`.
+     It runs through Google's Antigravity CLI (`agy`), which must be installed and
+     logged in, and it never reviews unless asked.
    - Work that is already committed: add `--base <branch-or-commit>`.
    - To review one piece of a larger change early, add `--paths <files or folders>`.
      The result then says `(partial)`; the rest stays readable as context, and the
