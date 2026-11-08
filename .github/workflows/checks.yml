@@ -10,13 +10,21 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # 3.9 is macOS's built-in python3, the oldest that users commonly run.
         python: ["3.9", "3.12"]
+        # ubuntu-latest (Ubuntu 26.04) has no Python 3.9 build; Ubuntu 24.04 still does.
+        exclude:
+          - os: ubuntu-latest
+            python: "3.9"
+        include:
+          - os: ubuntu-24.04
+            python: "3.9"
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Validate plugin
