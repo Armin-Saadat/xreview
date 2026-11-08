@@ -16,6 +16,7 @@ Python 3.8+, standard library only. Run `python3 xreview.py doctor --live` once
 on each machine.
 """
 import argparse
+import collections
 import concurrent.futures
 import datetime as dt
 import fnmatch
@@ -35,7 +36,7 @@ import tempfile
 import threading
 import time
 
-VERSION = '0.7.0'
+VERSION = '0.8.0'
 REVIEWERS = ('codex', 'claude', 'gemini')
 NAMES = {'codex': 'Codex', 'claude': 'Claude Code', 'gemini': 'Gemini'}
 # The command behind each reviewer. Gemini reviews run through Google's Antigravity
@@ -53,10 +54,14 @@ DEFAULT_CONFIG = {
     'codex': {'bin': None, 'model': 'gpt-6-astra', 'effort': 'medium', 'tools': True},
     'claude': {'bin': None, 'model': 'claude-opus-5-5', 'effort': 'high'},
     'gemini': {'bin': None, 'model': 'gemini-4-argon', 'effort': 'high'},
-    # Councils: who takes part, the round limit, and web access. With web on, Codex
-    # searches OpenAI's cached index, Gemini searches through agy, and Claude searches
-    # and may open pages on these hosts only (exact host names).
-    'council': {'members': ['claude', 'codex', 'gemini'], 'rounds': 5, 'web': True,
+    # Councils: who takes part, the round limit, and web access. A member is
+    # AGENT[:MODEL][@EFFORT], such as "codex:gpt-6.1-sol@high"; without a model or effort
+    # it uses that agent's reviewer settings above, and an agent may take part several
+    # times. Every member answers at the same time; parallel_per_agent, if set, lets only
+    # that many members of one agent answer at once (for an account's rate limits).
+    # With web on, Codex searches OpenAI's cached index, Gemini searches through agy, and
+    # Claude searches and may open pages on these hosts only (exact host names).
+    'council': {'members': ['claude', 'codex', 'gemini'], 'rounds': 5, 'web': True, 'parallel_per_agent': None,
                 'fetch_hosts': [
                     'arxiv.org', 'export.arxiv.org', 'openreview.net', 'aclanthology.org',
                     'www.semanticscholar.org', 'api.semanticscholar.org', 'pubmed.ncbi.nlm.nih.gov',
@@ -300,10 +305,18 @@ def load_config():
         raise Fail('"codex": {{"tools": ...}} in {} must be true, "repo" or false'.format(path))
     council = cfg['council']
     members = council.get('members')
-    if (not isinstance(members, list) or len(set(members)) < 2
-            or any(m not in REVIEWERS for m in members)):
-        raise Fail('"council": {{"members": ...}} in {} must list at least two of {}'.format(
-            path, ', '.join(REVIEWERS)))
+    if not isinstance(members, list) or len(members) < 2:
+        raise Fail('"council": {{"members": ...}} in {} must list at least two members, such as '
+                   '["claude", "codex", "gemini"]'.format(path))
+    for spec in members:
+        try:
+            parse_member(spec)
+        except Fail as exc:
+            raise Fail('"council": {{"members": ...}} in {}: {}'.format(path, exc))
+    parallel = council.get('parallel_per_agent')
+    if parallel is not None and (isinstance(parallel, bool) or not isinstance(parallel, int) or parallel < 1):
+        raise Fail('"council": {{"parallel_per_agent": ...}} in {} must be null (no limit) or a whole number of '
+                   'at least 1'.format(path))
     rounds = council.get('rounds')
     if isinstance(rounds, bool) or not isinstance(rounds, int) or not \
             MIN_COUNCIL_ROUNDS <= rounds <= MAX_COUNCIL_ROUNDS:
@@ -1985,9 +1998,8 @@ def cmd_cancel(args):
 # may open pages on the configured hosts only. A member whose call fails leaves the
 # council: a missing answer never counts as agreement.
 
-COUNCIL_LETTERS = 'ABCDEFGH'
 MAX_BRIEF_BYTES = 256 * 1024
-MAX_PROPOSALS = 3
+MAX_PROPOSALS = 3                # per member; two from five members on (council_max_proposals)
 MAX_INCLUDE_FILES = MAX_COPY_FILES
 ASSESSMENTS = ('strong', 'viable', 'weak', 'non_starter')
 DECISIONS = ('sign', 'amend', 'object')
@@ -2031,9 +2043,9 @@ COUNCIL_SCHEMAS = {
 PHASE_TITLES = {'proposals': 'proposals', 'critique': 'cross-critique', 'draft': 'drafting the memo',
                 'revise': 'revising the memo', 'signoff': 'sign-off'}
 
-COUNCIL_PROMPT = '''You are member {letter} of a council of {count} AI agents, each a different model,
-deliberating on a question for the user, a researcher and developer. Members are
-known only by letter. The goal is the best direction for the user, not agreement:
+COUNCIL_PROMPT = '''You are member {letter} of a council of {count} AI agents, deliberating on a
+question for the user, a researcher and developer. Members are known only by
+letter. The goal is the best direction for the user, not agreement:
 challenge weak reasoning, including your own; separate evidence from speculation;
 be concrete (files, numbers, sources); and say what would change your mind. You
 are running as an xreview council member: do not start reviews, councils, other
@@ -2147,6 +2159,71 @@ COUNCIL_WEB_NOTES = {
 }
 
 
+# A member is AGENT[:MODEL][@EFFORT]. A model may contain dots, colons, slashes and brackets
+# ("us.anthropic.claude-opus-5-5-v1:0", "claude-opus-5-5[1m]") but never starts with a
+# dash, so it cannot pass for a command-line option of the agent's CLI.
+MEMBER_RE = re.compile(r'^([A-Za-z]+)(?::([A-Za-z0-9][A-Za-z0-9._:/\[\]-]*))?(?:@([a-z]+))?$')
+
+
+def parse_member(spec):
+    """(agent, model, effort) of a member spec; model and effort are None when not given."""
+    match = MEMBER_RE.match(spec.strip()) if isinstance(spec, str) else None
+    if not match:
+        raise Fail('council member {!r} is not AGENT[:MODEL][@EFFORT] (for example codex:gpt-6.1-sol@high)'.format(
+            spec))
+    agent = match.group(1).lower()
+    if agent not in REVIEWERS:
+        raise Fail('unknown council member {}; choose from {}'.format(match.group(1), ', '.join(REVIEWERS)))
+    return agent, match.group(2), match.group(3)
+
+
+def council_members(specs, cfg):
+    """[(member, agent, options)] for the specs, in order. An agent may take part several times:
+    its first member is named after it ("codex"), later ones are numbered ("codex-2"). A model
+    or effort in the spec replaces the agent's reviewer setting."""
+    members, seen = [], collections.Counter()
+    for spec in specs:
+        agent, model, effort = parse_member(spec)
+        seen[agent] += 1
+        options = dict(cfg[agent])
+        if model:
+            options['model'] = model
+        if effort:
+            options['effort'] = effort
+        members.append((agent if seen[agent] == 1 else '{}-{}'.format(agent, seen[agent]), agent, options))
+    return members
+
+
+def member_agent(meta, member):
+    """The agent behind a member ('codex' for 'codex-2'); councils before 0.8 used agent names."""
+    return (meta.get('agents') or {}).get(member) or member
+
+
+def council_letter(index):
+    """The label of the index-th member, from 0: A to Z, then AA, AB and so on."""
+    label, index = '', index + 1
+    while index:
+        index, rest = divmod(index - 1, 26)
+        label = chr(ord('A') + rest) + label
+    return label
+
+
+def letter_key(label):
+    return len(label), label
+
+
+def council_max_proposals(count):
+    """Proposals per member. Every member critiques every proposal, so from five members on
+    each proposes at most two, which keeps the cross-critique a manageable size."""
+    return MAX_PROPOSALS if count <= 4 else 2
+
+
+def council_calls(count, rounds):
+    """The fewest and the most agent calls of a council when nobody drops out: consensus in
+    round 3, or a memo revised until the round limit."""
+    return 3 * count + 1, 2 * count + (rounds - 2) * (count + 1)
+
+
 def schema_violation(data, schema, where='the answer'):
     """First way `data` breaks `schema` (the subset of JSON Schema xreview uses), or None."""
     kind = schema.get('type')
@@ -2188,9 +2265,9 @@ def check_council_answer(schema_name, data, ctx):
     if problem:
         return None, 'the answer does not match the {} schema ({})'.format(schema_name, problem)
     if schema_name == 'proposals':
-        count = len(data['proposals'])
-        if not 1 <= count <= MAX_PROPOSALS:
-            return None, 'the answer has {} proposals; 1 to {} are allowed'.format(count, MAX_PROPOSALS)
+        count, most = len(data['proposals']), (ctx or {}).get('max_proposals', MAX_PROPOSALS)
+        if not 1 <= count <= most:
+            return None, 'the answer has {} proposals; 1 to {} are allowed'.format(count, most)
         if any(not p['title'].strip() for p in data['proposals']):
             return None, 'a proposal has no title'
     elif schema_name == 'critique':
@@ -2216,11 +2293,11 @@ def check_council_answer(schema_name, data, ctx):
     return data, None
 
 
-def council_tool_note(member, options, web, hosts):
-    key = {'diff': 'codex-diff-only', 'repo': 'codex-repo'}.get(codex_mode(member, options), member)
+def council_tool_note(agent, options, web, hosts):
+    key = {'diff': 'codex-diff-only', 'repo': 'codex-repo'}.get(codex_mode(agent, options), agent)
     note = COUNCIL_TOOL_NOTES[key]
-    note += COUNCIL_WEB_NOTES[member].format(hosts=', '.join(hosts)) if web else '; you have no web access'
-    return note + ('. Every other tool is blocked.' if member == 'gemini' else '.')
+    note += COUNCIL_WEB_NOTES[agent].format(hosts=', '.join(hosts)) if web else '; you have no web access'
+    return note + ('. Every other tool is blocked.' if agent == 'gemini' else '.')
 
 
 def council_files_note(meta, member=None):
@@ -2294,7 +2371,7 @@ def memo_text(memo, version=None, level=1):
 
 
 def by_letter(meta, members):
-    return sorted(members, key=lambda m: meta['labels'][m])
+    return sorted(members, key=lambda m: letter_key(meta['labels'][m]))
 
 
 def proposal_entries(meta, round1):
@@ -2321,13 +2398,15 @@ def proposals_text(meta, round1, compact=False):
     return '\n'.join(lines).strip()
 
 
-def critiques_text(meta, round2):
+def critiques_text(meta, round2, limit=None):
+    """Every member's critiques, for the drafter; `limit` shortens each strength and weakness."""
+    cut = (lambda text: shorten(text.strip(), limit)) if limit else (lambda text: text.strip())  # noqa: E731
     lines = []
     for member in by_letter(meta, round2):
         answer = round2[member]
         lines.append('## Member {}'.format(meta['labels'][member]))
-        lines += ['- {} ({}): strengths: {} | weaknesses: {}'.format(c['proposal'], c['assessment'], c['strengths'].strip(),
-                                                                  c['weaknesses'].strip()) for c in answer['critiques']]
+        lines += ['- {} ({}): strengths: {} | weaknesses: {}'.format(c['proposal'], c['assessment'], cut(c['strengths']),
+                                                                  cut(c['weaknesses'])) for c in answer['critiques']]
         lines += ['Ranking of the other members\' proposals, best first: ' + (', '.join(answer['ranking']) or '(none)'),
                   'Revised position: ' + answer['revised_position'].strip(),
                   'What would change their mind: ' + answer['would_change_mind'].strip(), '']
@@ -2356,6 +2435,7 @@ def drafter_order(meta, active, round1, round2):
     """Members by the best score any of their proposals got from the others' rankings, and the
     scores. With n proposals in all, a ranking's first place gets n points, the next n - 1 and
     so on, so every member's first choice weighs the same however many proposals it made.
+    Every member's ranking counts the same, also when several members share an agent.
     Letters, assigned at random, break ties."""
     owner = {label: member for label, member, _ in proposal_entries(meta, round1)}
     score = dict.fromkeys(owner, 0)
@@ -2363,7 +2443,7 @@ def drafter_order(meta, active, round1, round2):
         for pos, label in enumerate(answer['ranking']):
             score[label] += len(owner) - pos
     best = {m: max([score[label] for label, o in owner.items() if o == m] or [-1]) for m in active}
-    return sorted(active, key=lambda m: (-best[m], meta['labels'][m])), score
+    return sorted(active, key=lambda m: (-best[m], letter_key(meta['labels'][m]))), score
 
 
 def council_includes(repo, paths, policy):
@@ -2435,28 +2515,28 @@ def cmd_council(args, wait_after=False):
     if len(brief.encode('utf-8')) > MAX_BRIEF_BYTES:
         raise Fail('the brief is over {} KB; summarize it, and --include the files the members should '
                    'read'.format(MAX_BRIEF_BYTES // 1024))
-    requested = [m.strip() for m in args.members.split(',')] if args.members else list(ccfg['members'])
-    requested = list(dict.fromkeys(m for m in requested if m))
-    unknown = [m for m in requested if m not in REVIEWERS]
-    if unknown:
-        raise Fail('unknown council member {}; choose from {}'.format(unknown[0], ', '.join(REVIEWERS)))
+    specs = [m.strip() for m in args.members.split(',')] if args.members else list(ccfg['members'])
+    wanted = council_members([m for m in specs if m], cfg)
     rounds = args.rounds or ccfg['rounds']
     if not MIN_COUNCIL_ROUNDS <= rounds <= MAX_COUNCIL_ROUNDS:
         raise Fail('--rounds must be from {} to {}'.format(MIN_COUNCIL_ROUNDS, MAX_COUNCIL_ROUNDS))
     web = ccfg['web'] if args.web is None else args.web
-    members, binaries, notes = [], {}, []
-    for member in requested:
-        try:
-            binaries[member] = find_binary(member, cfg)
-        except Fail as exc:
-            if args.members or member != 'gemini':
-                raise
-            notes.append('Gemini is not set up on this machine, so it is not a member ({})'.format(exc))
-            continue
-        members.append(member)
+    members, agents, options, binaries, notes, found = [], {}, {}, {}, [], {}
+    for member, agent, member_options in wanted:
+        if agent not in found:
+            try:
+                found[agent] = find_binary(agent, cfg)
+            except Fail as exc:
+                if args.members or agent != 'gemini':
+                    raise
+                found[agent] = None
+                notes.append('Gemini is not set up on this machine, so it is not a member ({})'.format(exc))
+        if found[agent]:
+            members.append(member)
+            agents[member], options[member], binaries[member] = agent, member_options, found[agent]
     if len(members) < 2:
         raise Fail('a council needs at least two members; available here: {}'.format(
-            ', '.join(NAMES[m] for m in members) or 'none'))
+            ', '.join(NAMES[agents[m]] for m in members) or 'none'))
 
     # A git repository gets a project copy; any other folder only the files included.
     base = Path(args.repo).expanduser()
@@ -2479,7 +2559,7 @@ def cmd_council(args, wait_after=False):
     job = state_dir() / 'jobs' / job_id
     job.mkdir(parents=True, mode=0o700)
     os.chmod(str(state_dir()), 0o700)
-    letters = list(COUNCIL_LETTERS[:len(members)])
+    letters = [council_letter(i) for i in range(len(members))]
     secrets.SystemRandom().shuffle(letters)
     labels = dict(zip(members, letters))
     scope = list(dict.fromkeys(names + included))
@@ -2487,16 +2567,17 @@ def cmd_council(args, wait_after=False):
     try:
         (job / 'trees').mkdir(mode=0o700)
         for member in members:
+            gemini = agents[member] == 'gemini'
             tree = job / 'trees' / member
             policy_file = job / 'policy-{}.json'.format(member)
-            write_json(policy_file, {'private': policy.private_patterns + (['/.agents/'] if member == 'gemini' else [])})
+            write_json(policy_file, {'private': policy.private_patterns + (['/.agents/'] if gemini else [])})
             files, size, copy_notes = build_review_copy(repo, tree, scope,
-                                                        exclude_dirs=AGY_CONFIG_DIRS if member == 'gemini' else ())
-            if member == 'gemini':
+                                                        exclude_dirs=AGY_CONFIG_DIRS if gemini else ())
+            if gemini:
                 write_agy_workspace(tree, git_dir, policy_file, web=web)
             trees[member] = str(tree)
             copies[member] = {'files': files, 'bytes': size, 'notes': copy_notes}
-            if copy is None or member != 'gemini':
+            if copy is None or not gemini:
                 copy = copies[member]
     except OSError as exc:
         shutil.rmtree(str(job), ignore_errors=True)
@@ -2509,8 +2590,9 @@ def cmd_council(args, wait_after=False):
         write_json(job / 'previous.json', previous)
     meta = {
         'kind': 'council', 'id': job_id, 'job_dir': str(job), 'version': VERSION, 'status': 'queued',
-        'members': members, 'labels': labels, 'binaries': binaries,
-        'options': {m: dict(cfg[m]) for m in members}, 'rounds_max': rounds, 'web': web,
+        'members': members, 'agents': agents, 'labels': labels, 'binaries': binaries, 'options': options,
+        'max_proposals': council_max_proposals(len(members)), 'parallel_per_agent': ccfg['parallel_per_agent'],
+        'rounds_max': rounds, 'web': web,
         'fetch_hosts': list(ccfg['fetch_hosts']) if web else [], 'repo': str(repo), 'is_git': is_git,
         'branch': branch, 'head': head, 'git_dir': git_dir, 'trees': trees, 'copy': copy, 'copies': copies,
         'includes': list(args.include or []), 'included_files': len(included), 'refused': refused,
@@ -2525,7 +2607,7 @@ def cmd_council(args, wait_after=False):
     (job / 'worker.pid').write_text(str(worker.pid), encoding='utf-8')
 
     print('Started council {} with {} (up to {} rounds; web search {}).'.format(
-        job_id, ', '.join(NAMES[m] for m in members), rounds, 'on' if web else 'off'))
+        job_id, ', '.join(member_name(meta, m) for m in members), rounds, 'on' if web else 'off'))
     for note in notes:
         print('Note: ' + note + '.')
     if not is_git:
@@ -2535,7 +2617,9 @@ def cmd_council(args, wait_after=False):
         print('Members may also read {} included file(s) under: {}'.format(len(included), ', '.join(args.include)))
     if refused:
         print('Left out of the included files (credential-like or private): ' + ', '.join(refused[:20]))
-    print("A council often takes 10-25 minutes and uses every member's quota.")
+    fewest, most = council_calls(len(members), rounds)
+    print("This council makes {} to {} agent calls, which use each member's quota; a council of three "
+          "usually takes 10-25 minutes.".format(fewest, most))
     print('Next: {} wait {}'.format(self_cmd(), job_id))
     return wait_for(job_id, None) if wait_after else EXIT_OK
 
@@ -2587,6 +2671,11 @@ class CouncilRun:
         self.round_no = 0
         self.env = {k: v for k, v in os.environ.items() if k not in COUNCIL_ENV_DROP}
         self.env['XREVIEW_ROLE'] = 'reviewer'
+        # Members of one agent share its account; parallel_per_agent, if set, limits how many
+        # of them answer at once. By default every member answers at the same time.
+        limit = self.meta.get('parallel_per_agent') or len(self.meta['members'])
+        self.slots = {agent: threading.BoundedSemaphore(limit)
+                      for agent in {member_agent(self.meta, m) for m in self.meta['members']}}
 
     def on_term(self, signum, frame):
         self.cancelled = True
@@ -2612,13 +2701,13 @@ class CouncilRun:
     def setup_problem(self, member):
         """Why a member cannot take part safely, or None. Fails closed like a review."""
         meta = self.meta
-        tree = meta['trees'][member]
-        if member == 'codex' and codex_mode(member, meta['options'][member]) == 'shell':
+        tree, agent = meta['trees'][member], member_agent(meta, member)
+        if agent == 'codex' and codex_mode(agent, meta['options'][member]) == 'shell':
             problem = codex_confinement_problem(meta['binaries'][member], tree)
             if problem:
                 return ('Codex could not confine its shell to the project copy ({}); if its sandbox cannot '
                         'work on this machine, set "codex": {{"tools": "repo"}} in {}'.format(problem, config_path()))
-        if member == 'gemini':
+        if agent == 'gemini':
             problem = agy_gate_problem(tree, meta['web'])
             if problem:
                 return 'the gate that keeps Gemini read-only failed its check: ' + problem
@@ -2629,10 +2718,11 @@ class CouncilRun:
         tag = secrets.token_hex(4)
         letter = meta['labels'][member]
         text = COUNCIL_TASKS[task].format(tag=tag, rounds=meta['rounds_max'], letter=letter,
-                                          max_proposals=MAX_PROPOSALS, **fields)
+                                          max_proposals=meta.get('max_proposals', MAX_PROPOSALS), **fields)
         return COUNCIL_PROMPT.format(
             letter=letter, count=len(meta['members']), date=dt.date.today().isoformat(),
-            tool_note=council_tool_note(member, meta['options'][member], meta['web'], meta['fetch_hosts']),
+            tool_note=council_tool_note(member_agent(meta, member), meta['options'][member], meta['web'],
+                                        meta['fetch_hosts']),
             files=council_files_note(meta, member), tag=tag, brief=self.brief.strip(),
             previous=council_previous_note(self.previous, tag), task=text)
 
@@ -2642,12 +2732,12 @@ class CouncilRun:
         call_dir = self.job / 'calls' / 'r{}-{}-{}'.format(rnd, phase, member)
         call_dir.mkdir(parents=True, exist_ok=True)
         (call_dir / 'prompt.md').write_text(prompt, encoding='utf-8')
-        tree = Path(meta['trees'][member])
-        cmd = agent_command(member, meta['binaries'][member], meta['options'][member], tree,
+        tree, agent = Path(meta['trees'][member]), member_agent(meta, member)
+        cmd = agent_command(agent, meta['binaries'][member], meta['options'][member], tree,
                             COUNCIL_SCHEMAS[schema_name], self.job / 'schemas' / (schema_name + '.json'),
                             call_dir / 'output.txt', self.job / 'policy-{}.json'.format(member),
                             meta.get('git_dir'), meta['fetch_hosts'] if meta['web'] else None)
-        stdin_text = prompt if member != 'gemini' else \
+        stdin_text = prompt if agent != 'gemini' else \
             json.dumps({'event': 'user', 'message': {'content': prompt}}) + '\n'
         key = (rnd, phase, member)
 
@@ -2661,15 +2751,22 @@ class CouncilRun:
             if cancelled:
                 kill_group(proc)
 
-        error = run_agent(cmd, tree, stdin_text, meta['timeout_minutes'] * 60, call_dir, self.env, register)
+        slot = self.slots[agent]
+        while not slot.acquire(timeout=1):      # another member of this agent is answering
+            if self.cancelled:
+                return None, 'cancelled'
+        try:
+            error = run_agent(cmd, tree, stdin_text, meta['timeout_minutes'] * 60, call_dir, self.env, register)
+        finally:
+            slot.release()
         stdout_text = (call_dir / 'stdout.txt').read_text(encoding='utf-8', errors='replace')
-        reported = reported_settings(member, call_dir, stdout_text, stderr_name='stderr.txt')
+        reported = reported_settings(agent, call_dir, stdout_text, stderr_name='stderr.txt')
         with self.lock:
             if reported and member not in self.reported:
                 self.reported[member] = reported
         if error:
             return None, error
-        answer, error = parse_output(member, call_dir, stdout_text,
+        answer, error = parse_output(agent, call_dir, stdout_text,
                                      validate=lambda data: check_council_answer(schema_name, data, ctx),
                                      stderr_name='stderr.txt', output_name='output.txt')
         if answer is not None:
@@ -2721,7 +2818,9 @@ class CouncilRun:
             return self.finish('failed', 'fewer than two members could take part')
 
         self.progress(1, 'independent proposals')
-        self.round1 = self.run_round(1, 'proposals', 'proposals', lambda m: self.prompt(m, 'proposals'))
+        most = meta.get('max_proposals', MAX_PROPOSALS)
+        self.round1 = self.run_round(1, 'proposals', 'proposals', lambda m: self.prompt(m, 'proposals'),
+                                     lambda m: {'max_proposals': most})
         if len(self.active) < 2:
             return self.finish('failed', 'fewer than two members answered round 1')
         entries = proposal_entries(meta, self.round1)
@@ -2736,7 +2835,9 @@ class CouncilRun:
             return self.finish('failed', 'fewer than two members answered round 2')
         order, scores = drafter_order(meta, self.active, self.round1, self.round2)
         self.save(scores=scores)
-        critiques = critiques_text(meta, self.round2)
+        # The drafter reads every member's critique of every proposal, which grows with the
+        # square of the council's size: in large councils each point is shortened.
+        critiques = critiques_text(meta, self.round2, limit=None if len(meta['members']) <= 8 else 300)
         positions = positions_text(meta, self.round2)
         compact = proposals_text(meta, self.round1, compact=True)
 
@@ -2824,8 +2925,26 @@ def cmd_council_worker(job_dir):
         raise
 
 
+def member_name(meta, member):
+    """How reports name a member: its agent, plus its model when the council has several
+    members of that agent, plus its effort and then its letter while that is still ambiguous."""
+    agent = member_agent(meta, member)
+    peers = [m for m in meta['members'] if member_agent(meta, m) == agent]
+    if len(peers) == 1:
+        return NAMES[agent]
+    setting = lambda m, key: meta['options'][m].get(key)  # noqa: E731
+    name = '{} {}'.format(NAMES[agent], setting(member, 'model') or '(default model)')
+    same_model = [m for m in peers if setting(m, 'model') == setting(member, 'model')]
+    if len(same_model) > 1:
+        name += ' at {} effort'.format(setting(member, 'effort') or 'default')
+        if sum(setting(m, 'effort') == setting(member, 'effort') for m in same_model) > 1:
+            name += ' (member {})'.format(meta['labels'][member])
+    return name
+
+
 def member_title(meta, member):
-    return '{} (member {})'.format(NAMES[member], meta['labels'][member])
+    name, letter = member_name(meta, member), '(member {})'.format(meta['labels'][member])
+    return name if name.endswith(letter) else '{} {}'.format(name, letter)
 
 
 def render_council(meta, result):
@@ -2842,20 +2961,21 @@ def render_council(meta, result):
 
     lines = ['# Council {}: {}'.format(meta['id'], 'consensus' if consensus else 'no consensus'), '',
              '- Question: ' + meta.get('title', ''),
-             '- Members: ' + '; '.join('{} with {}'.format(member_title(meta, m), model(m)) for m in members),
+             '- Members: ' + '; '.join('{} (member {}) with {}'.format(NAMES[member_agent(meta, m)], meta['labels'][m],
+                                                                       model(m)) for m in members),
              '- Rounds: {} of at most {}; web search {}'.format(result['rounds_used'], meta['rounds_max'],
                                                                 'on' if meta['web'] else 'off')]
     if meta.get('followup_of'):
         lines.append('- Follows up council ' + meta['followup_of'])
     if consensus:
         lines.append('- Outcome: every member signed memo version {}, drafted by {}'.format(
-            result['version'], NAMES[result['drafter']]))
+            result['version'], member_name(meta, result['drafter'])))
     else:
         lines.append('- Outcome: **no consensus**: {} of {} members signed memo version {}{}'.format(
             len(signed), len(members), result['version'],
-            ' ({})'.format(', '.join(NAMES[m] for m in signed)) if signed else ''))
+            ' ({})'.format(', '.join(member_name(meta, m) for m in signed)) if signed else ''))
     for member, reason in result['dropped'].items():
-        lines.append('- {} left the council: {}'.format(NAMES[member], shorten(reason, 300)))
+        lines.append('- {} left the council: {}'.format(member_name(meta, member), shorten(reason, 300)))
     lines += ['', '## {} (memo version {})'.format('Agreed direction' if consensus else 'Final memo, not agreed by all',
                                                    result['version']), '', memo_text(result['memo'], level=3), '',
               '## Sign-offs']
@@ -2885,11 +3005,12 @@ def render_council(meta, result):
     for entry in result['history']:
         if entry['phase'] in ('draft', 'revise'):
             lines.append('- Round {}: {} {} memo version {}'.format(
-                entry['round'], NAMES[entry['drafter']], 'drafted' if entry['phase'] == 'draft' else 'revised to',
+                entry['round'], member_name(meta, entry['drafter']), 'drafted' if entry['phase'] == 'draft' else 'revised to',
                 entry['version']))
         elif entry['phase'] == 'signoff':
             lines.append('- Round {}: on version {}, {}'.format(entry['round'], entry['version'], ', '.join(
-                '{} {}'.format(NAMES[m], DECISION_WORDS[a['decision']]) for m, a in sorted(entry['answers'].items()))))
+                '{} {}'.format(member_name(meta, m), DECISION_WORDS[entry['answers'][m]['decision']])
+                for m in members if m in entry['answers'])))
     return '\n'.join(lines) + '\n'
 
 
@@ -3517,7 +3638,8 @@ def main(argv=None):
     def add_council_args(p):
         p.add_argument('--brief', help='the question and its context, as text')
         p.add_argument('--brief-file', help='read the brief from a file (- for stdin)')
-        p.add_argument('--members', help='comma-separated members (default: claude,codex,gemini)')
+        p.add_argument('--members', help='comma-separated members, each AGENT[:MODEL][@EFFORT] such as '
+                       'codex:gpt-6.1-sol@high; an agent may appear more than once (default: claude,codex,gemini)')
         p.add_argument('--rounds', type=int, help='round limit, {} to {} (default 5)'.format(
             MIN_COUNCIL_ROUNDS, MAX_COUNCIL_ROUNDS))
         p.add_argument('--include', nargs='+', metavar='PATH',

@@ -42,7 +42,9 @@ from this repository.
   Code, Codex and Gemini brainstorm, plan next steps or read results together: they
   propose independently, critique each other's proposals anonymously, and revise a
   joint memo until every member signs it or the round limit records the dissent.
-  Members get the same read-only isolation as reviewers, plus web search
+  You can also seat several members of one agent, each with its own model and
+  effort, such as two Claude models and three Codex ones. Members get the same
+  read-only isolation as reviewers, plus web search
   ([details](skills/xreview/references/setup.md#councils)). In the trigger evals,
   Claude convened a council in 3 of 3 runs when asked to brainstorm with the other
   agents, and in none of 3 for a question it could answer itself.

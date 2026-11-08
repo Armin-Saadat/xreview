@@ -20,9 +20,11 @@ _spec.loader.exec_module(xreview)
 # One fake handles all three CLIs (codex, claude and agy for Gemini). FAKE_MODE picks the behaviour.
 FAKE = textwrap.dedent('''\
     #!{python}
-    import json, os, re, subprocess, sys, time
+    import atexit, json, os, re, subprocess, sys, time
     args = sys.argv[1:]
     name = os.path.basename(sys.argv[0])
+    model = args[args.index('--model') + 1] if '--model' in args else 'default'
+    who = name + ':' + model               # tells apart council members of one CLI
     log = os.environ.get('FAKE_LOG')
     if args[:1] == ['--version']:
         print(name + ' 9.9.9'); sys.exit(0)
@@ -55,6 +57,14 @@ FAKE = textwrap.dedent('''\
     required = set((schema or {{}}).get('required', []))
     phase = ('proposals' if 'proposals' in required else 'critique' if 'critiques' in required else
              'memo' if 'direction' in required else 'signoff' if 'decision' in required else None)
+    running = os.environ.get('FAKE_RUNNING_DIR')
+    if running and phase:
+        # How many calls of this CLI run at once: each leaves a marker until it exits.
+        os.makedirs(running, exist_ok=True)
+        marker = os.path.join(running, name + '-' + str(os.getpid()))
+        open(marker, 'w').close()
+        atexit.register(os.remove, marker)
+        extra['concurrent'] = len([f for f in os.listdir(running) if f.startswith(name + '-')])
     if name == 'agy':
         # Stream mode: one NDJSON user event on stdin.
         event = json.loads(prompt.splitlines()[0])
@@ -87,7 +97,7 @@ FAKE = textwrap.dedent('''\
                        for d, _, names in os.walk(os.getcwd()) for n in names)
         record = {{'args': args, 'role': os.environ.get('XREVIEW_ROLE'), 'cwd': os.getcwd(),
                   'files': files, 'pid': os.getpid(), 'prompt_len': len(prompt), 'name': name,
-                  'phase': phase, 'claudecode': os.environ.get('CLAUDECODE')}}
+                  'who': who, 'phase': phase, 'claudecode': os.environ.get('CLAUDECODE')}}
         if os.environ.get('FAKE_LOG_PROMPT'):
             record['prompt'] = prompt
         record.update(extra)
@@ -116,24 +126,26 @@ FAKE = textwrap.dedent('''\
     }}.get(mode)
     text = 'this is not json' if mode == 'badjson' else json.dumps(review)
     if phase:
-        # FAKE_COUNCIL: object=<cli>, amend_once=<cli>, prefer=<cli>, fail=<cli>[:<phase>]
+        # FAKE_COUNCIL: object=<who>, amend_once=<who>, contradict=<who>, partial=<who>, where <who>
+        # is a CLI name or <cli>:<model>; prefer=<text in a proposal title>; fail=<cli>[:<phase>]
         directives = dict(item.split('=', 1) for item in os.environ.get('FAKE_COUNCIL', '').split(',') if '=' in item)
-        letter = re.search(r'You are member ([A-Z])', prompt).group(1)
+        hit = lambda key: directives.get(key) in (name, who)
+        letter = re.search(r'You are member ([A-Z]+)', prompt).group(1)
         fail = directives.get('fail', '').split(':')
         if fail[0] == name and (len(fail) < 2 or fail[1] == phase):
             sys.stderr.write('boom: ' + name + ' failed in ' + phase + '\\n'); sys.exit(1)
         if phase == 'proposals':
             answer = {{'analysis': 'Analysis by ' + name, 'proposals': [
-                {{'title': 'Plan from ' + name, 'summary': 'Do the ' + name + ' thing.', 'rationale': 'because',
+                {{'title': 'Plan from ' + who, 'summary': 'Do the ' + name + ' thing.', 'rationale': 'because',
                   'expected_outcome': 'better', 'risks': 'some', 'cost': 'a day', 'first_steps': ['start'],
                   'evidence': ['stats.py:1']}}], 'not_verified': []}}
         elif phase == 'critique':
-            labels = re.findall(r'^### Proposal ([A-Z][0-9]+): (.*)$', prompt, re.M)
+            labels = re.findall(r'^### Proposal ([A-Z]+[0-9]+): (.*)$', prompt, re.M)
             titles = dict(labels)
-            others = [label for label, _ in labels if not label.startswith(letter)]
+            others = [label for label, _ in labels if not re.fullmatch(letter + '[0-9]+', label)]
             prefer = directives.get('prefer')
             others.sort(key=lambda label: 0 if prefer and prefer in titles[label] else 1)
-            if directives.get('partial') == name:                    # an incomplete ranking
+            if hit('partial'):                                       # an incomplete ranking
                 others = others[:1]
             answer = {{'critiques': [{{'proposal': label, 'assessment': 'viable', 'strengths': 's', 'weaknesses': 'w'}}
                                     for label, _ in labels],
@@ -152,11 +164,11 @@ FAKE = textwrap.dedent('''\
         else:
             version = int(re.search(r'sign-off on version ([0-9]+)', prompt).group(1))
             decision = 'sign'
-            if directives.get('object') == name:
+            if hit('object'):
                 decision = 'object'
-            elif directives.get('amend_once') == name and version == 1:
+            elif hit('amend_once') and version == 1:
                 decision = 'amend'
-            contradict = directives.get('contradict') == name          # signs, yet still requires changes
+            contradict = hit('contradict')                             # signs, yet still requires changes
             answer = {{'decision': decision, 'reason': name + ' reasons', 'main_risk': 'overfitting',
                       'falsifier': 'no gain on validation', 'first_step': 'run the ablation',
                       'requested_changes': ['add a baseline'] if decision == 'amend' or contradict else [],
@@ -168,7 +180,6 @@ FAKE = textwrap.dedent('''\
             print(json.dumps({{'event': 'result', 'result': {{'status': 'ERROR', 'response': '',
                                                              'error': 'RESOURCE_EXHAUSTED (code 429)'}}}}))
             sys.exit(1)
-        model = args[args.index('--model') + 1] if '--model' in args else 'default'
         print(json.dumps({{'event': 'init', 'init': {{'model': model}}}}))
         result = {{'status': 'SUCCESS', 'response': '' if mode == 'noanswer' else text}}
         if mode not in ('badjson', 'noanswer'):
@@ -1307,7 +1318,10 @@ class Council(Base):
         self.assertIn('at least two members', out)
         code, out = self.xr('council', 'start', '--brief-file', str(self.brief), '--rounds', '2')
         self.assertIn('--rounds must be from 3 to 10', out)
-        for council, message in (({'members': ['claude']}, 'at least two of'), ({'rounds': 11}, 'whole number'),
+        for council, message in (({'members': ['claude']}, 'at least two members'), ({'rounds': 11}, 'whole number'),
+                                 ({'members': ['claude', 'cursor']}, 'unknown council member cursor'),
+                                 ({'members': ['claude', 'codex:bad model']}, 'is not AGENT[:MODEL][@EFFORT]'),
+                                 ({'parallel_per_agent': 0}, 'at least 1'), ({'parallel_per_agent': True}, 'at least 1'),
                                  ({'web': 'yes'}, 'true or false'),
                                  ({'fetch_hosts': ['https://arxiv.org']}, 'host names')):
             self.write_config(council=council)
@@ -1337,6 +1351,119 @@ class Council(Base):
         self.assertEqual(decide('search_web', {'query': 'x'}), 'deny')
         self.assertIsNone(xreview.agy_gate_problem(root, web=True))
         self.assertIsNone(xreview.agy_gate_problem(root))
+
+    def test_several_members_per_agent_each_with_its_own_settings(self):
+        members = 'claude,claude:claude-fable-5-1@max,codex:gpt-a@high,codex:gpt-b,codex:gpt-b@low,gemini'
+        code, out = self.council('--members', members, env={'FAKE_LOG_PROMPT': '1'})
+        self.assertEqual(code, 0, out)
+        self.assertIn(': consensus (6 of 6 members signed memo version 1; 3 rounds)', out)
+        self.assertIn('This council makes 19 to 33 agent calls', out)
+        meta = self.meta(self.council_id(out))
+        self.assertEqual(meta['members'], ['claude', 'claude-2', 'codex', 'codex-2', 'codex-3', 'gemini'])
+        self.assertEqual(sorted(meta['labels'].values()), list('ABCDEF'))
+        proposals = self.council_calls('proposals')
+        self.assertEqual(len(proposals), 6)
+        self.assertEqual(len({c['cwd'] for c in proposals}), 6)              # a copy and a session each
+
+        def settings(call):
+            args = call['args']
+            if call['name'] == 'codex':
+                effort = next(a for a in args if a.startswith('model_reasoning_effort='))
+                effort = json.loads(effort.split('=', 1)[1])
+            else:
+                effort = args[args.index('--effort') + 1]
+            return call['name'], args[args.index('--model') + 1], effort
+        self.assertEqual(sorted(settings(c) for c in proposals), sorted([
+            ('claude', 'claude-opus-5-5', 'high'), ('claude', 'claude-fable-5-1', 'max'),
+            ('codex', 'gpt-a', 'high'), ('codex', 'gpt-b', 'medium'), ('codex', 'gpt-b', 'low'),
+            ('agy', 'gemini-4-argon', 'high')]))
+        for call in proposals:
+            self.assertIn('a council of 6 AI agents', call['prompt'])
+            self.assertIn('1 to 2 distinct candidate directions', call['prompt'])   # fewer in a large council
+            for model in ('gpt-a', 'gpt-b', 'claude-fable', 'claude-opus', 'gemini-4'):
+                self.assertNotIn(model, call['prompt'])                     # models stay anonymous too
+        for name in ('**Claude Code claude-opus-5-5 (member', '**Claude Code claude-fable-5-1 (member',
+                     '**Codex gpt-a (member', '**Codex gpt-b at medium effort (member', '**Codex gpt-b at low effort (member',
+                     '**Gemini (member'):
+            self.assertIn(name, out)                                        # sign-offs say which model is which
+        self.assertIn('Codex (member {}) with gpt-b, effort low'.format(meta['labels']['codex-3']), out)
+
+        self.log.unlink()
+        code, out = self.council('--members', 'claude,claude', env={'FAKE_COUNCIL': 'object=claude'})
+        self.assertEqual(code, 2, out)                                      # identical members, told apart by letter
+        self.assertRegex(out, r'\*\*Claude Code claude-opus-5-5 at high effort \(member [AB]\): objects\.\*\*')
+        self.assertEqual(len(self.council_calls('proposals')), 2)
+
+    def test_a_member_is_targeted_by_model(self):
+        code, out = self.council('--members', 'codex:gpt-a,codex:gpt-b,claude',
+                                 env={'FAKE_COUNCIL': 'contradict=codex:gpt-b'})
+        self.assertEqual(code, 2, out)
+        self.assertIn('Codex gpt-b left the council: round 3 (sign-off)', out)
+        self.assertIn('2 of 3 members signed', out)
+
+    def test_member_specs(self):
+        parse = xreview.parse_member
+        self.assertEqual(parse('codex:gpt-6.1-sol@high'), ('codex', 'gpt-6.1-sol', 'high'))
+        self.assertEqual(parse(' Claude '), ('claude', None, None))
+        self.assertEqual(parse('gemini@low'), ('gemini', None, 'low'))
+        self.assertEqual(parse('claude:us.anthropic.claude-opus-5-5-v1:0'), ('claude', 'us.anthropic.claude-opus-5-5-v1:0', None))
+        self.assertEqual(parse('claude:claude-opus-5-5[1m]@max'), ('claude', 'claude-opus-5-5[1m]', 'max'))
+        for spec in ('cursor', 'codex:', 'codex@', 'codex:-c', 'codex:--dangerously-bypass-approvals-and-sandbox',
+                     'codex@High', 'codex:gpt 6', 'codex:a@b@c', 'codex:gpt;rm', 'codex@-x', '', None, 5):
+            with self.assertRaises(xreview.Fail, msg=repr(spec)):
+                parse(spec)
+        cfg = xreview.load_config()
+        members = xreview.council_members(['codex', 'claude', 'codex:gpt-x', 'codex@low'], cfg)
+        self.assertEqual([(m, a, o.get('model'), o.get('effort')) for m, a, o in members], [
+            ('codex', 'codex', 'gpt-6-astra', 'medium'), ('claude', 'claude', 'claude-opus-5-5', 'high'),
+            ('codex-2', 'codex', 'gpt-x', 'medium'), ('codex-3', 'codex', 'gpt-6-astra', 'low')])
+        self.assertEqual(cfg['codex']['model'], 'gpt-6-astra')            # the reviewer settings are untouched
+        self.assertEqual([xreview.council_letter(i) for i in (0, 25, 26, 27, 701, 702)],
+                         ['A', 'Z', 'AA', 'AB', 'ZZ', 'AAA'])
+        meta = {'labels': {'x': 'B', 'y': 'AA', 'z': 'A'}}
+        self.assertEqual(xreview.by_letter(meta, ['x', 'y', 'z']), ['z', 'x', 'y'])
+        self.assertEqual(xreview.council_calls(3, 5), (10, 18))
+        self.assertEqual([xreview.council_max_proposals(n) for n in (2, 4, 5, 30)], [3, 3, 2, 2])
+        answer = {'analysis': 'a', 'not_verified': [], 'proposals': [
+            {'title': 't', 'summary': 's', 'rationale': 'r', 'expected_outcome': 'e', 'risks': 'r', 'cost': 'c',
+             'first_steps': [], 'evidence': []}] * 3}
+        self.assertIsNone(xreview.check_council_answer('proposals', answer, None)[1])
+        self.assertIn('1 to 2 are allowed', xreview.check_council_answer('proposals', answer, {'max_proposals': 2})[1])
+        code, out = self.xr('council', 'start', '--brief-file', str(self.brief), '--members', 'claude,cursor')
+        self.assertEqual(code, 1, out)
+        self.assertIn('unknown council member cursor', out)
+        code, out = self.xr('council', 'start', '--brief-file', str(self.brief), '--members', 'claude,codex:-x')
+        self.assertEqual(code, 1, out)
+        self.assertIn('is not AGENT[:MODEL][@EFFORT]', out)
+
+    def test_every_member_has_one_equal_vote_for_the_drafter(self):
+        members = ['codex', 'codex-2', 'codex-3', 'claude', 'gemini']
+        meta = {'members': members, 'agents': dict(zip(members, ['codex'] * 3 + ['claude', 'gemini'])),
+                'labels': dict(zip(members, 'ABCDE'))}
+        round1 = {m: {'proposals': [{'title': m}]} for m in members}
+        rankings = {'codex': ['B1', 'D1', 'C1', 'E1'], 'codex-2': ['C1', 'D1', 'A1', 'E1'],
+                    'codex-3': ['A1', 'D1', 'B1', 'E1'], 'claude': ['E1', 'A1', 'B1', 'C1'],
+                    'gemini': ['D1', 'A1', 'B1', 'C1']}
+        round2 = {m: {'ranking': r} for m, r in rankings.items()}
+        # Three Codex members are three votes: their second places put D1 (17 points) ahead of
+        # A1 (16), which Claude and Gemini rank high.
+        order, scores = xreview.drafter_order(meta, members, round1, round2)
+        self.assertEqual((order[0], scores['D1'], scores['A1']), ('claude', 17, 16))
+
+    def test_members_answer_at_once_unless_limited(self):
+        running = str(self.tmp / 'running')
+        code, out = self.council('--members', 'codex:m1,codex:m2,codex:m3,claude',
+                                 env={'FAKE_MODE': 'sleep1', 'FAKE_RUNNING_DIR': running})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(max(c['concurrent'] for c in self.council_calls() if c['name'] == 'codex'), 3)
+        self.log.unlink()
+        self.write_config(council={'parallel_per_agent': 2})
+        code, out = self.council('--members', 'codex:m1,codex:m2,codex:m3,codex:m4,claude',
+                                 env={'FAKE_MODE': 'sleep1', 'FAKE_RUNNING_DIR': running})
+        self.assertEqual(code, 0, out)
+        self.assertIn('5 of 5 members signed', out)
+        self.assertEqual(max(c['concurrent'] for c in self.council_calls() if c['name'] == 'codex'), 2)
+        self.assertEqual(len(self.council_calls('proposals')), 5)
 
 
 class PathPatterns(unittest.TestCase):

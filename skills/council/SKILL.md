@@ -12,8 +12,9 @@ report what it concluded. You do not argue; a fresh session of your own model is
 one of the members. The conclusion is advice for the user, never permission to act.
 
 The council runs the xreview script at `<skill-dir>/../xreview/scripts/xreview.py`
-(`xreview.py` below). It usually takes 10–25 minutes and uses the quota of every
-member's account, so convene one only when the user asks for it.
+(`xreview.py` below). A council of three usually takes 10–25 minutes (more members
+take longer) and uses the quota of every member's account, so convene one only when
+the user asks for it.
 
 ## Steps
 
@@ -34,7 +35,12 @@ member's account, so convene one only when the user asks for it.
      members to read. Include only what the question is about; credential-like
      and private files are refused anyway.
    - `--no-web` if the user wants no web search; it is on by default.
-   - `--members claude,codex` or `--rounds N` (3 to 10, default 5) only if asked.
+   - `--members` only if the user names members, models or efforts: a
+     comma-separated list of `AGENT[:MODEL][@EFFORT]` where an agent may appear more
+     than once, for example
+     `--members claude,claude:claude-fable-5-1,codex:gpt-6.1-sol@high,gemini`. Use
+     the model names the user gives; xreview does not check them.
+   - `--rounds N` (3 to 10, default 5) only if asked.
 
    It prints a council id. If your shell runs commands in a sandbox without
    network access, run it outside the sandbox.

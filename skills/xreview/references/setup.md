@@ -191,8 +191,8 @@ first 64 KB. Use it for invariants a reviewer cannot infer, for example:
 sessions of Claude Code, Codex and Gemini deliberate on a question without a diff:
 brainstorming, planning, reading results, choosing a research direction.
 
-1. **Proposals.** Each member proposes one to three directions without seeing the
-   others.
+1. **Proposals.** Each member proposes one to three directions (one or two in a
+   council of five or more) without seeing the others.
 2. **Cross-critique.** Each member critiques every proposal and ranks the other
    members' ones. Proposals carry member letters, never model names, so no member
    defers to a brand or favours its own.
@@ -201,6 +201,25 @@ brainstorming, planning, reading results, choosing a research direction.
    questions. Every member signs it, asks for specific changes or objects, and the
    drafter revises, until every member signs the same version or the round limit
    (default 5) is reached. Then the result shows the final memo and the dissent.
+
+By default the members are one session each of Claude Code, Codex and Gemini, with
+the reviewer models above. `--members`, or `"members"` in the configuration, takes
+any number of members, each written `AGENT[:MODEL][@EFFORT]`; an agent may appear
+more than once:
+
+```bash
+xreview.py council start --brief-file brief.md \
+  --members claude,claude:claude-fable-5-1,codex:gpt-6-astra@high,codex:gpt-6.1-sol,gemini
+```
+
+A member without a model or effort uses that agent's reviewer setting. xreview passes
+model names to the CLI unchecked: a misspelt one makes that member fail in round 1,
+which rules out consensus. Every member is an equal member: it answers each round at
+the same time as the others, its ranking counts the same when the drafter is chosen,
+and consensus takes its signature. Members of one agent share that agent's account, so
+reports name them by model (and by effort too when two share a model), and if they
+fail on the account's rate limits, `"parallel_per_agent": N` in the configuration lets
+only N members of one agent answer at once.
 
 Members are fresh sessions that cannot start reviews or councils, and they work like
 reviewers: each in its own read-only copy of the project (what git would commit,
@@ -223,8 +242,11 @@ So a page that tries to talk a member into sending your results somewhere can
 reach only the search providers and the listed research sites. Search queries go to
 the providers, so with web search on, details of unpublished work can reach them.
 
-A council of three makes 10 to 18 calls (three to five rounds) and usually takes
-10 to 25 minutes. It uses every member's quota, including Antigravity credits. Each
+A council of n members makes 3n + 1 to 2n + (rounds - 2)(n + 1) calls when nobody
+leaves: 10 to 18 for three members and the default five rounds, 22 to 38 for seven.
+Three members usually take 10 to 25 minutes, and larger councils longer; from nine
+members on, the drafter reads shortened critiques. A council uses every member's
+quota, including Antigravity credits. Each
 job folder keeps the brief, every prompt and answer (`calls/`), `council.md` (what
 `show` prints) and `transcript.md` (the whole discussion, with model names). Gemini
 members' sessions are saved in your agy conversation history, as reviews are.
@@ -240,8 +262,8 @@ Settings, in the same configuration file:
 
 Setting `fetch_hosts` replaces the default list (research and preprint sites, journals,
 GitHub, Hugging Face and library documentation); `xreview.py council start --help`
-lists the other options. Members use the reviewer models above. Gemini is optional:
-when agy is not set up, the default council has two members.
+lists the other options. Gemini is optional: when agy is not set up, the default
+council has two members.
 
 ## Troubleshooting
 
@@ -257,7 +279,7 @@ when agy is not set up, the default council has two members.
 | `.xreview.json is not valid JSON`, `unknown key`, `negated patterns are not supported` | Fix `.xreview.json`; xreview will not review without knowing what is private |
 | Gemini: `the Antigravity CLI is not logged in`, or `authentication failed` | Run `agy` once in a terminal on that machine and finish the Google sign-in |
 | Gemini: `Your AI credits balance is too low to continue` | The Antigravity account is out of AI credits. Wait for them to refill, or choose a cheaper model such as `"gemini": {"model": "gemini-3.8-flash"}` |
-| Council: `<member> left the council: ...` | That member's call failed (see the reason, for example an expired login or no credits). The council went on without it, and the result is at best `no_consensus` |
+| Council: `<member> left the council: ...` | That member's call failed (see the reason, for example an expired login, no credits or a misspelt model name). The council went on without it, and the result is at best `no_consensus` |
 | Council: `FAILED - fewer than two members ...` | A council needs at least two members; check each with `doctor --reviewer <name>` |
 | Gemini: `the Gemini review gate failed its check` | The hook that keeps agy read-only could not run (for example the Python that runs xreview moved), so the review did not start. `doctor --reviewer gemini` shows why |
 | `running inside the Codex sandbox` | Re-run `start` with escalated permissions |
