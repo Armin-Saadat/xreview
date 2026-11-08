@@ -97,7 +97,8 @@ FAKE = textwrap.dedent('''\
                        for d, _, names in os.walk(os.getcwd()) for n in names)
         record = {{'args': args, 'role': os.environ.get('XREVIEW_ROLE'), 'cwd': os.getcwd(),
                   'files': files, 'pid': os.getpid(), 'prompt_len': len(prompt), 'name': name,
-                  'who': who, 'phase': phase, 'claudecode': os.environ.get('CLAUDECODE')}}
+                  'who': who, 'phase': phase, 'claudecode': os.environ.get('CLAUDECODE'),
+                  'again': 'could not be used' in prompt}}
         if os.environ.get('FAKE_LOG_PROMPT'):
             record['prompt'] = prompt
         record.update(extra)
@@ -126,10 +127,12 @@ FAKE = textwrap.dedent('''\
     }}.get(mode)
     text = 'this is not json' if mode == 'badjson' else json.dumps(review)
     if phase:
-        # FAKE_COUNCIL: object=<who>, amend_once=<who>, contradict=<who>, partial=<who>, where <who>
-        # is a CLI name or <cli>:<model>; prefer=<text in a proposal title>; fail=<cli>[:<phase>]
+        # FAKE_COUNCIL: object=<who>, amend_once=<who>, contradict=<who>, contradict_once=<who>,
+        # partial=<who>, titled=<who>, where <who> is a CLI name or <cli>:<model>;
+        # prefer=<text in a proposal title>; fail=<cli>[:<phase>]
         directives = dict(item.split('=', 1) for item in os.environ.get('FAKE_COUNCIL', '').split(',') if '=' in item)
         hit = lambda key: directives.get(key) in (name, who)
+        again = 'could not be used' in prompt                         # asked once more after a rejection
         letter = re.search(r'You are member ([A-Z]+)', prompt).group(1)
         fail = directives.get('fail', '').split(':')
         if fail[0] == name and (len(fail) < 2 or fail[1] == phase):
@@ -147,9 +150,10 @@ FAKE = textwrap.dedent('''\
             others.sort(key=lambda label: 0 if prefer and prefer in titles[label] else 1)
             if hit('partial'):                                       # an incomplete ranking
                 others = others[:1]
-            answer = {{'critiques': [{{'proposal': label, 'assessment': 'viable', 'strengths': 's', 'weaknesses': 'w'}}
-                                    for label, _ in labels],
-                      'ranking': others, 'revised_position': name + ' favours a combined plan',
+            name_it = (lambda label: label + ': ' + titles[label]) if hit('titled') else (lambda label: label)
+            answer = {{'critiques': [{{'proposal': name_it(label), 'assessment': 'viable', 'strengths': 's',
+                                      'weaknesses': 'w'}} for label, _ in labels],
+                      'ranking': [name_it(label) for label in others], 'revised_position': name + ' favours a combined plan',
                       'would_change_mind': 'new data'}}
         elif phase == 'memo':
             revising = re.search(r'Write version ([0-9]+)', prompt)
@@ -168,7 +172,7 @@ FAKE = textwrap.dedent('''\
                 decision = 'object'
             elif hit('amend_once') and version == 1:
                 decision = 'amend'
-            contradict = hit('contradict')                             # signs, yet still requires changes
+            contradict = hit('contradict') or (hit('contradict_once') and not again)   # signs, yet asks for changes
             answer = {{'decision': decision, 'reason': name + ' reasons', 'main_risk': 'overfitting',
                       'falsifier': 'no gain on validation', 'first_step': 'run the ablation',
                       'requested_changes': ['add a baseline'] if decision == 'amend' or contradict else [],
@@ -1163,19 +1167,61 @@ class Council(Base):
         code, out = self.council('--members', 'codex,gemini', env={'FAKE_MODE': 'credits'})
         self.assertEqual(code, 1, out)
         self.assertIn('FAILED - fewer than two members answered round 1', out)
+        self.log.unlink()
         code, out = self.council(env={'FAKE_COUNCIL': 'fail=codex:critique'})
         self.assertEqual(code, 2, out)
         self.assertIn('Codex left the council: round 2 (cross-critique)', out)
+        self.assertEqual(len([c for c in self.council_calls('critique') if c['name'] == 'codex']), 1)   # not repeated
 
-    def test_contradictory_or_incomplete_answers_are_rejected(self):
+    def test_contradictory_answers_are_asked_again_then_rejected(self):
         code, out = self.council(env={'FAKE_COUNCIL': 'contradict=claude'})
         self.assertEqual(code, 2, out)                                  # no consensus despite three "sign"s
         self.assertIn('Claude Code left the council: round 3 (sign-off)', out)
         self.assertIn('"sign" with requested changes', out)
+        self.assertIn("Round 3: Claude Code's answer (sign-off) could not be used, so it was asked again", out)
+        claude = [c for c in self.council_calls('signoff') if c['name'] == 'claude']
+        self.assertEqual([c['again'] for c in claude], [False, True])  # asked once more, then it left
+
+    def test_an_answer_that_could_not_be_used_is_asked_for_again(self):
+        code, out = self.council(env={'FAKE_COUNCIL': 'contradict_once=claude', 'FAKE_LOG_PROMPT': '1'})
+        self.assertEqual(code, 0, out)
+        self.assertIn('3 of 3 members signed memo version 1', out)
+        self.assertIn("Claude Code's answer (sign-off) could not be used, so it was asked again: "
+                      '"sign" with requested changes', out)
+        again = [c for c in self.council_calls('signoff') if c['again']]
+        self.assertEqual([c['name'] for c in again], ['claude'])
+        self.assertIn('Your previous answer to this task could not be used: "sign" with requested changes',
+                      again[0]['prompt'])
+        job = Path(self.meta(self.council_id(out))['job_dir'])
+        self.assertTrue((job / 'calls' / 'r3-signoff-claude-again').is_dir())   # both answers are kept
+
+    def test_rankings_are_read_as_written(self):
+        code, out = self.council(env={'FAKE_COUNCIL': 'titled=claude,prefer=codex'})
+        self.assertEqual(code, 0, out)                                  # "A1: <title>" names A1
+        self.assertIn('3 of 3 members signed', out)
+        self.assertIn('drafted by Codex', out)
+        meta = self.meta(self.council_id(out))
+        result = json.loads((Path(meta['job_dir']) / 'result.json').read_text())
+        claude = result['round2']['claude']
+        others = sorted(l for m, l in meta['labels'].items() if m != 'claude')
+        self.assertEqual(sorted(claude['ranking']), [l + '1' for l in others])
+        self.assertTrue(all(': Plan from ' in entry for entry in claude['ranking_as_written']))
+        self.assertIn(': Plan from ', claude['critiques'][0]['proposal'])     # critiques stay as written
+        self.log.unlink()
         code, out = self.council(env={'FAKE_COUNCIL': 'partial=codex'})
-        self.assertEqual(code, 2, out)
-        self.assertIn("Codex left the council: round 2 (cross-critique)", out)
-        self.assertIn("every other member's proposal exactly once", out)
+        self.assertEqual(code, 0, out)                                  # an incomplete ranking still counts
+        self.assertNotIn('left the council', out)
+
+        labels, titles = ['A1', 'A2', 'B1', 'AA1'], {'A1': 'Flagship paper', 'B1': 'Benchmark suite'}
+        read = lambda text: xreview.resolve_label(text, labels, titles)  # noqa: E731
+        for text, label in (('A1', 'A1'), (' a2 ', 'A2'), ('B1: Benchmark suite', 'B1'), ('Proposal B1', 'B1'),
+                            ('1. B1', 'B1'), ('AA1 (the other one)', 'AA1'), ('the flagship paper', 'A1'),
+                            ('A1, then B1', 'A1'), ('combine A1 and B1', None), ('C1', None), ('A1x', None),
+                            ('nothing here', None)):
+            self.assertEqual(read(text), label, text)
+        ranked, ignored = xreview.resolve_ranking(['B1: Benchmark suite', 'A1', 'b1', 'C9', 'A2'], labels, titles,
+                                                  own=['A2'])
+        self.assertEqual((ranked, ignored), (['B1', 'A1'], ['b1', 'C9', 'A2']))
 
     def test_the_top_ranked_member_drafts(self):
         code, out = self.council(env={'FAKE_COUNCIL': 'prefer=codex'})
@@ -1428,7 +1474,7 @@ class Council(Base):
             {'title': 't', 'summary': 's', 'rationale': 'r', 'expected_outcome': 'e', 'risks': 'r', 'cost': 'c',
              'first_steps': [], 'evidence': []}] * 3}
         self.assertIsNone(xreview.check_council_answer('proposals', answer, None)[1])
-        self.assertIn('1 to 2 are allowed', xreview.check_council_answer('proposals', answer, {'max_proposals': 2})[1])
+        self.assertIn('no proposals', xreview.check_council_answer('proposals', dict(answer, proposals=[]), None)[1])
         code, out = self.xr('council', 'start', '--brief-file', str(self.brief), '--members', 'claude,cursor')
         self.assertEqual(code, 1, out)
         self.assertIn('unknown council member cursor', out)

@@ -63,6 +63,13 @@ the repository itself; they are not loaded into projects that install the plugin
   `search_web` through the gate's `--web` mode) and Claude's `WebFetch` on the exact
   `fetch_hosts`; never a shell with network. A failed or missing answer is never a
   signature.
+- Councils read members' answers as a person would (the user's choice): a proposal
+  named by label and title counts, and critiques and rankings need not be complete,
+  because those fields only pick the drafter and inform the memo. What would fake
+  agreement or leave nothing to use stays strict: an answer that is not the schema's
+  JSON, a memo without a direction or plan, a "sign" that still asks for changes. Such
+  an answer is asked for once more, with the reason, never repaired; a failed call
+  (error, timeout) is not repeated. Reviews stay strict throughout.
 - Never print or send credentials. Extend `SECRET_GLOBS` rather than special-casing.
 - Every behaviour change gets a test in `tests/test_xreview.py`. Use the fake CLI
   (`FAKE_MODE`) rather than real model calls.

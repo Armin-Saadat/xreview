@@ -36,7 +36,7 @@ import tempfile
 import threading
 import time
 
-VERSION = '0.8.0'
+VERSION = '0.8.1'
 REVIEWERS = ('codex', 'claude', 'gemini')
 NAMES = {'codex': 'Codex', 'claude': 'Claude Code', 'gemini': 'Gemini'}
 # The command behind each reviewer. Gemini reviews run through Google's Antigravity
@@ -1592,6 +1592,9 @@ def agy_result(stdout_text):
     return result
 
 
+NOT_JSON = 'the reviewer answer was not valid JSON'
+
+
 def parse_output(reviewer, job, stdout_text, validate=None, stderr_name='reviewer-stderr.txt',
                  output_name='reviewer-output.txt'):
     """Return (answer, error): a review, or with `validate` any schema-checked answer.
@@ -1633,7 +1636,7 @@ def parse_output(reviewer, job, stdout_text, validate=None, stderr_name='reviewe
     try:
         return check(json.loads(raw))
     except ValueError:
-        return None, 'the reviewer answer was not valid JSON'
+        return None, NOT_JSON
 
 
 def reported_settings(reviewer, job, stdout_text, stderr_name='reviewer-stderr.txt'):
@@ -2089,9 +2092,9 @@ PROPOSALS-{tag}>>>
 Critique every proposal, your own included: real strengths, real weaknesses,
 evidence that is missing or wrong, and an assessment (strong, viable, weak or
 non_starter), in a few sentences each. Then rank the other members' proposals from
-best to worst by label, leaving your own out, and state your revised position in
-under about 150 words: the direction you now favour, which may combine proposals,
-and what would change your mind.''',
+best to worst, leaving your own out; refer to proposals by label, such as "A1". Last,
+state your revised position in under about 150 words: the direction you now favour,
+which may combine proposals, and what would change your mind.''',
     'draft': '''Round {round} of at most {rounds}: you are the drafter, because a proposal of yours
 ranked highest in the cross-critique. Write the council's joint memo: the version
 you believe every member can sign. Build on the strongest parts of all proposals
@@ -2141,6 +2144,9 @@ MEMO-{tag}>>>
 {answers}
 ANSWERS-{tag}>>>''',
 }
+COUNCIL_RETRY_NOTE = '''
+
+Your previous answer to this task could not be used: {reason}. Answer the whole task again.'''
 COUNCIL_TOOL_NOTES = {
     'claude': 'You have Read, Grep and Glob in the project copy',
     'codex': ('You may run read-only inspection commands in the project copy (cat, ls, grep, '
@@ -2259,26 +2265,53 @@ def schema_violation(data, schema, where='the answer'):
     return '{} has an unsupported schema'.format(where)
 
 
+def resolve_label(text, labels, titles):
+    """The proposal that `text` names, read as a person would: its label ("A1", "a1"), the label
+    with its title ("A1: Flagship paper", "Proposal A1") or the title alone. None when the text
+    names no proposal, or several without leading with one."""
+    by_label = {label.upper(): label for label in labels}
+    text = text.strip()
+    lead = re.match(r'^\W*(?:proposal\s+)?([A-Za-z]+[0-9]+)(?![A-Za-z0-9])', text, re.I)
+    if lead and lead.group(1).upper() in by_label:
+        return by_label[lead.group(1).upper()]
+    found = [label for label in labels
+             if re.search(r'(?<![A-Za-z0-9]){}(?![A-Za-z0-9])'.format(re.escape(label)), text, re.I)]
+    if not found:
+        found = [label for label in labels
+                 if titles.get(label, '').strip() and titles[label].strip().lower() in text.lower()]
+    return found[0] if len(found) == 1 else None
+
+
+def resolve_ranking(entries, labels, titles, own):
+    """(ranked labels, entries left out): a ranking read as a person would. Entries that name no
+    proposal, repeat one or name the member's own are left out; the rest keep their order."""
+    ranked, ignored = [], []
+    for entry in entries:
+        label = resolve_label(entry, labels, titles)
+        if label is None or label in ranked or label in own:
+            ignored.append(entry)
+        else:
+            ranked.append(label)
+    return ranked, ignored
+
+
 def check_council_answer(schema_name, data, ctx):
-    """(answer, error) for one member's answer. Malformed answers are rejected, never repaired."""
+    """(answer, error) for one member's answer, read as a person would read it: a proposal named
+    by its label and title counts, and critiques and rankings need not be complete. Rejected are
+    answers that are not the JSON the schema describes, or that would leave nothing to use or
+    fake agreement (a memo without a direction, a signature that still asks for changes)."""
     problem = schema_violation(data, COUNCIL_SCHEMAS[schema_name])
     if problem:
         return None, 'the answer does not match the {} schema ({})'.format(schema_name, problem)
     if schema_name == 'proposals':
-        count, most = len(data['proposals']), (ctx or {}).get('max_proposals', MAX_PROPOSALS)
-        if not 1 <= count <= most:
-            return None, 'the answer has {} proposals; 1 to {} are allowed'.format(count, most)
-        if any(not p['title'].strip() for p in data['proposals']):
-            return None, 'a proposal has no title'
+        if not data['proposals']:
+            return None, 'the answer has no proposals'
     elif schema_name == 'critique':
-        # Complete answers only: a partial ranking would skew which member drafts.
-        critiqued = [item['proposal'] for item in data['critiques']]
-        if sorted(critiqued) != sorted(ctx['labels']):
-            return None, 'the critiques must cover every proposal exactly once ({})'.format(', '.join(ctx['labels']))
-        others = [label for label in ctx['labels'] if label not in ctx['own']]
-        if sorted(data['ranking']) != sorted(others):
-            return None, "the ranking must list every other member's proposal exactly once ({})".format(
-                ', '.join(others))
+        ranked, ignored = resolve_ranking(data['ranking'], ctx['labels'], ctx.get('titles') or {}, ctx['own'])
+        if ranked != data['ranking']:
+            data = dict(data, ranking=ranked, ranking_as_written=data['ranking'])
+        if ignored:
+            data['ranking_ignored'] = ignored
     elif schema_name == 'memo':
         if not data['direction'].strip() or not data['plan']:
             return None, 'the memo has no direction or no plan'
@@ -2435,8 +2468,8 @@ def drafter_order(meta, active, round1, round2):
     """Members by the best score any of their proposals got from the others' rankings, and the
     scores. With n proposals in all, a ranking's first place gets n points, the next n - 1 and
     so on, so every member's first choice weighs the same however many proposals it made.
-    Every member's ranking counts the same, also when several members share an agent.
-    Letters, assigned at random, break ties."""
+    Every member's ranking counts the same, also when several members share an agent; a
+    proposal a ranking leaves out gets no points from it. Letters, assigned at random, break ties."""
     owner = {label: member for label, member, _ in proposal_entries(meta, round1)}
     score = dict.fromkeys(owner, 0)
     for answer in round2.values():
@@ -2665,6 +2698,7 @@ class CouncilRun:
         self.active = list(self.meta['members'])
         self.dropped = {}
         self.reported = {}
+        self.retries = []
         self.round1, self.round2 = {}, {}
         self.memo, self.version, self.drafter, self.signoffs = None, 0, None, {}
         self.history = []
@@ -2727,9 +2761,22 @@ class CouncilRun:
             previous=council_previous_note(self.previous, tag), task=text)
 
     def call(self, member, rnd, phase, schema_name, prompt, ctx):
-        """One member's answer: (answer, error)."""
+        """One member's answer: (answer, error). An answer that cannot be used is not repaired:
+        the member is asked once more, with the reason, and leaves only if that answer cannot
+        be used either. A failed call (an error, a timeout, no credits) is not repeated."""
+        answer, error, unusable = self.attempt(member, rnd, phase, schema_name, prompt, ctx, '')
+        if unusable and not self.cancelled:
+            with self.lock:
+                self.retries.append({'member': member, 'round': rnd, 'phase': phase, 'reason': error})
+            answer, error, _ = self.attempt(member, rnd, phase, schema_name,
+                                            prompt + COUNCIL_RETRY_NOTE.format(reason=error), ctx, '-again')
+        return answer, error
+
+    def attempt(self, member, rnd, phase, schema_name, prompt, ctx, suffix):
+        """(answer, error, unusable) of one call; unusable means the call worked but its answer
+        could not be used."""
         meta = self.meta
-        call_dir = self.job / 'calls' / 'r{}-{}-{}'.format(rnd, phase, member)
+        call_dir = self.job / 'calls' / 'r{}-{}-{}{}'.format(rnd, phase, member, suffix)
         call_dir.mkdir(parents=True, exist_ok=True)
         (call_dir / 'prompt.md').write_text(prompt, encoding='utf-8')
         tree, agent = Path(meta['trees'][member]), member_agent(meta, member)
@@ -2739,7 +2786,7 @@ class CouncilRun:
                             meta.get('git_dir'), meta['fetch_hosts'] if meta['web'] else None)
         stdin_text = prompt if agent != 'gemini' else \
             json.dumps({'event': 'user', 'message': {'content': prompt}}) + '\n'
-        key = (rnd, phase, member)
+        key = (rnd, phase + suffix, member)
 
         def register(proc):
             with self.lock:
@@ -2754,7 +2801,7 @@ class CouncilRun:
         slot = self.slots[agent]
         while not slot.acquire(timeout=1):      # another member of this agent is answering
             if self.cancelled:
-                return None, 'cancelled'
+                return None, 'cancelled', False
         try:
             error = run_agent(cmd, tree, stdin_text, meta['timeout_minutes'] * 60, call_dir, self.env, register)
         finally:
@@ -2765,13 +2812,20 @@ class CouncilRun:
             if reported and member not in self.reported:
                 self.reported[member] = reported
         if error:
-            return None, error
-        answer, error = parse_output(agent, call_dir, stdout_text,
-                                     validate=lambda data: check_council_answer(schema_name, data, ctx),
+            return None, error, False
+        rejected = []
+
+        def validate(data):
+            answer, problem = check_council_answer(schema_name, data, ctx)
+            if problem:
+                rejected.append(problem)
+            return answer, problem
+        answer, error = parse_output(agent, call_dir, stdout_text, validate=validate,
                                      stderr_name='stderr.txt', output_name='output.txt')
         if answer is not None:
             write_json(call_dir / 'answer.json', answer)
-        return answer, error
+            return answer, None, False
+        return None, error, bool(rejected) or error == NOT_JSON
 
     def run_round(self, rnd, phase, schema_name, prompt_for, ctx_for=lambda member: None):
         """Every active member answers in parallel; members whose call fails leave."""
@@ -2818,19 +2872,18 @@ class CouncilRun:
             return self.finish('failed', 'fewer than two members could take part')
 
         self.progress(1, 'independent proposals')
-        most = meta.get('max_proposals', MAX_PROPOSALS)
-        self.round1 = self.run_round(1, 'proposals', 'proposals', lambda m: self.prompt(m, 'proposals'),
-                                     lambda m: {'max_proposals': most})
+        self.round1 = self.run_round(1, 'proposals', 'proposals', lambda m: self.prompt(m, 'proposals'))
         if len(self.active) < 2:
             return self.finish('failed', 'fewer than two members answered round 1')
         entries = proposal_entries(meta, self.round1)
         labels = [label for label, _, _ in entries]
+        titles = {label: proposal['title'] for label, _, proposal in entries}
         proposals = proposals_text(meta, self.round1)
 
         self.progress(2, 'cross-critique')
         self.round2 = self.run_round(
             2, 'critique', 'critique', lambda m: self.prompt(m, 'critique', proposals=proposals),
-            lambda m: {'labels': labels, 'own': [label for label, owner, _ in entries if owner == m]})
+            lambda m: {'labels': labels, 'titles': titles, 'own': [label for label, owner, _ in entries if owner == m]})
         if len(self.active) < 2:
             return self.finish('failed', 'fewer than two members answered round 2')
         order, scores = drafter_order(meta, self.active, self.round1, self.round2)
@@ -2888,13 +2941,15 @@ class CouncilRun:
 
     def finish(self, status, reason, verdict=None):
         meta, job = self.meta, self.job
-        meta.update(active=list(self.active), dropped=dict(self.dropped), reported=dict(self.reported))
+        meta.update(active=list(self.active), dropped=dict(self.dropped), reported=dict(self.reported),
+                    retries=list(self.retries))
         result = None
         if status == 'done':
             result = {'verdict': verdict, 'memo': self.memo, 'version': self.version, 'drafter': self.drafter,
                       'signoffs': self.signoffs, 'dropped': self.dropped, 'members': meta['members'],
                       'labels': meta['labels'], 'rounds_used': self.round_no, 'scores': meta.get('scores'),
-                      'round1': self.round1, 'round2': self.round2, 'history': self.history}
+                      'round1': self.round1, 'round2': self.round2, 'history': self.history,
+                      'retries': self.retries}
             write_json(job / 'result.json', result)
             (job / 'council.md').write_text(render_council(meta, result), encoding='utf-8')
             (job / 'transcript.md').write_text(render_transcript(meta, result, self.brief), encoding='utf-8')
@@ -3002,6 +3057,15 @@ def render_council(meta, result):
     if scores:
         lines.append('- Cross-critique points: ' + ', '.join('{} {}'.format(k, v) for k, v in
                                                             sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))))
+    for member in by_letter(meta, result['round2']):
+        ignored = result['round2'][member].get('ranking_ignored')
+        if ignored:
+            lines.append("- {}'s ranking named {} as well, which matched no other member's proposal and did not "
+                         "count".format(member_name(meta, member), ', '.join('"{}"'.format(shorten(x, 80)) for x in ignored)))
+    for retry in result.get('retries') or []:
+        lines.append("- Round {}: {}'s answer ({}) could not be used, so it was asked again: {}".format(
+            retry['round'], member_name(meta, retry['member']), PHASE_TITLES[retry['phase']],
+            shorten(retry['reason'], 300)))
     for entry in result['history']:
         if entry['phase'] in ('draft', 'revise'):
             lines.append('- Round {}: {} {} memo version {}'.format(
@@ -3037,7 +3101,8 @@ def render_transcript(meta, result, brief):
         lines += ['', '### ' + who(member), '']
         lines += ['- {} ({}): strengths: {} Weaknesses: {}'.format(c['proposal'], c['assessment'], c['strengths'].strip(),
                                                                 c['weaknesses'].strip()) for c in answer['critiques']]
-        lines += ['', 'Ranking of the others: ' + (', '.join(answer['ranking']) or '(none)'), '',
+        lines += ['', 'Ranking of the others: ' + (', '.join(answer['ranking']) or '(none)') + (
+            ' (as written: {})'.format('; '.join(answer['ranking_as_written'])) if answer.get('ranking_as_written') else ''), '',
                   'Revised position: ' + answer['revised_position'].strip(), '',
                   'Would change their mind: ' + answer['would_change_mind'].strip()]
     for entry in result['history']:

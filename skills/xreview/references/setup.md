@@ -221,6 +221,14 @@ reports name them by model (and by effort too when two share a model), and if th
 fail on the account's rate limits, `"parallel_per_agent": N` in the configuration lets
 only N members of one agent answer at once.
 
+Answers are read as a person would read them: a proposal named by its label and title
+counts, and a critique or ranking that skips or repeats a proposal still counts for the
+rest (the report lists ranking entries that matched no proposal). A member whose
+answer cannot be used at all (not the JSON its CLI was asked for, a memo without a
+direction or plan, a "sign" that still asks for changes) is asked once more, with the
+reason, and leaves only if that answer cannot be used either. A member whose call
+fails (an error, a timeout, no credits) leaves at once.
+
 Members are fresh sessions that cannot start reviews or councils, and they work like
 reviewers: each in its own read-only copy of the project (what git would commit,
 minus credential-like and `private` paths), with the same confinement as in
@@ -279,7 +287,7 @@ council has two members.
 | `.xreview.json is not valid JSON`, `unknown key`, `negated patterns are not supported` | Fix `.xreview.json`; xreview will not review without knowing what is private |
 | Gemini: `the Antigravity CLI is not logged in`, or `authentication failed` | Run `agy` once in a terminal on that machine and finish the Google sign-in |
 | Gemini: `Your AI credits balance is too low to continue` | The Antigravity account is out of AI credits. Wait for them to refill, or choose a cheaper model such as `"gemini": {"model": "gemini-3.8-flash"}` |
-| Council: `<member> left the council: ...` | That member's call failed (see the reason, for example an expired login, no credits or a misspelt model name). The council went on without it, and the result is at best `no_consensus` |
+| Council: `<member> left the council: ...` | That member's call failed (see the reason, for example an expired login, no credits or a misspelt model name), or its answer could not be used even when it was asked again. The council went on without it, and the result is at best `no_consensus` |
 | Council: `FAILED - fewer than two members ...` | A council needs at least two members; check each with `doctor --reviewer <name>` |
 | Gemini: `the Gemini review gate failed its check` | The hook that keeps agy read-only could not run (for example the Python that runs xreview moved), so the review did not start. `doctor --reviewer gemini` shows why |
 | `running inside the Codex sandbox` | Re-run `start` with escalated permissions |

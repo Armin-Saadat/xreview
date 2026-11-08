@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "xreview",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Cross-agent code review and councils: Codex and Claude Code review each other's work read-only from the real git diff, with checks for ML experiment validity, and Claude, Codex and Gemini can deliberate on plans and results until they sign off on a direction.",
   "author": {
     "name": "Armin Saadat"

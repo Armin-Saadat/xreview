@@ -71,7 +71,7 @@ The last line is
 | 1 | The council failed (for example, fewer than two members could take part): no conclusion |
 | 4 | Still running |
 
-A member whose call fails (an error, a timeout, a malformed answer, no credits)
-leaves the council, and the result says so; a missing answer never counts as
-agreement. What members can read and do, web access and settings are in
+A member whose call fails (an error, a timeout, no credits) leaves the council,
+and so does one whose answer cannot be used even after it is asked once more; the
+result says so, and a missing answer never counts as agreement. What members can read and do, web access and settings are in
 [setup](../xreview/references/setup.md#councils).
