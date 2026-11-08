@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent council"
+  short_description: "Claude, Codex and Gemini deliberate and sign off on a direction"
+  default_prompt: "Use $council to have the agents deliberate on my question and agree on a direction."

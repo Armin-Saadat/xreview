@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -19,7 +20,7 @@ _spec.loader.exec_module(xreview)
 # One fake handles all three CLIs (codex, claude and agy for Gemini). FAKE_MODE picks the behaviour.
 FAKE = textwrap.dedent('''\
     #!{python}
-    import json, os, subprocess, sys, time
+    import json, os, re, subprocess, sys, time
     args = sys.argv[1:]
     name = os.path.basename(sys.argv[0])
     log = os.environ.get('FAKE_LOG')
@@ -44,6 +45,16 @@ FAKE = textwrap.dedent('''\
         sys.exit(0)
     prompt = sys.stdin.read()
     extra = {{}}
+    # Council rounds are told apart by the answer schema they ask for.
+    schema = None
+    if '--output-schema' in args:
+        schema = json.load(open(args[args.index('--output-schema') + 1]))
+    elif '--json-schema' in args:
+        value = args[args.index('--json-schema') + 1]
+        schema = json.loads(value) if value.lstrip().startswith('{{') else json.load(open(value))
+    required = set((schema or {{}}).get('required', []))
+    phase = ('proposals' if 'proposals' in required else 'critique' if 'critiques' in required else
+             'memo' if 'direction' in required else 'signoff' if 'decision' in required else None)
     if name == 'agy':
         # Stream mode: one NDJSON user event on stdin.
         event = json.loads(prompt.splitlines()[0])
@@ -75,7 +86,10 @@ FAKE = textwrap.dedent('''\
         files = sorted(os.path.relpath(os.path.join(d, n), os.getcwd())
                        for d, _, names in os.walk(os.getcwd()) for n in names)
         record = {{'args': args, 'role': os.environ.get('XREVIEW_ROLE'), 'cwd': os.getcwd(),
-                  'files': files, 'pid': os.getpid(), 'prompt_len': len(prompt)}}
+                  'files': files, 'pid': os.getpid(), 'prompt_len': len(prompt), 'name': name,
+                  'phase': phase, 'claudecode': os.environ.get('CLAUDECODE')}}
+        if os.environ.get('FAKE_LOG_PROMPT'):
+            record['prompt'] = prompt
         record.update(extra)
         with open(log, 'a') as f:
             f.write(json.dumps(record) + '\\n')
@@ -101,6 +115,53 @@ FAKE = textwrap.dedent('''\
                   'blockers': ['auth bypass']}},
     }}.get(mode)
     text = 'this is not json' if mode == 'badjson' else json.dumps(review)
+    if phase:
+        # FAKE_COUNCIL: object=<cli>, amend_once=<cli>, prefer=<cli>, fail=<cli>[:<phase>]
+        directives = dict(item.split('=', 1) for item in os.environ.get('FAKE_COUNCIL', '').split(',') if '=' in item)
+        letter = re.search(r'You are member ([A-Z])', prompt).group(1)
+        fail = directives.get('fail', '').split(':')
+        if fail[0] == name and (len(fail) < 2 or fail[1] == phase):
+            sys.stderr.write('boom: ' + name + ' failed in ' + phase + '\\n'); sys.exit(1)
+        if phase == 'proposals':
+            answer = {{'analysis': 'Analysis by ' + name, 'proposals': [
+                {{'title': 'Plan from ' + name, 'summary': 'Do the ' + name + ' thing.', 'rationale': 'because',
+                  'expected_outcome': 'better', 'risks': 'some', 'cost': 'a day', 'first_steps': ['start'],
+                  'evidence': ['stats.py:1']}}], 'not_verified': []}}
+        elif phase == 'critique':
+            labels = re.findall(r'^### Proposal ([A-Z][0-9]+): (.*)$', prompt, re.M)
+            titles = dict(labels)
+            others = [label for label, _ in labels if not label.startswith(letter)]
+            prefer = directives.get('prefer')
+            others.sort(key=lambda label: 0 if prefer and prefer in titles[label] else 1)
+            if directives.get('partial') == name:                    # an incomplete ranking
+                others = others[:1]
+            answer = {{'critiques': [{{'proposal': label, 'assessment': 'viable', 'strengths': 's', 'weaknesses': 'w'}}
+                                    for label, _ in labels],
+                      'ranking': others, 'revised_position': name + ' favours a combined plan',
+                      'would_change_mind': 'new data'}}
+        elif phase == 'memo':
+            revising = re.search(r'Write version ([0-9]+)', prompt)
+            answer = {{'title': 'Joint plan', 'direction': 'Combine the plans (drafted by ' + name + ').',
+                      'rationale': 'It uses the strongest parts.',
+                      'plan': [{{'step': 'Run the ablation', 'details': 'on the validation split'}}],
+                      'risks': [{{'risk': 'overfitting', 'mitigation': 'keep a held-out test set'}}],
+                      'kill_criteria': ['no gain on validation'],
+                      'alternatives': [{{'option': 'do nothing', 'why_not': 'no progress'}}],
+                      'open_questions': ['what is the compute budget?'],
+                      'responses': [{{'request': 'add a baseline', 'response': 'added'}}] if revising else []}}
+        else:
+            version = int(re.search(r'sign-off on version ([0-9]+)', prompt).group(1))
+            decision = 'sign'
+            if directives.get('object') == name:
+                decision = 'object'
+            elif directives.get('amend_once') == name and version == 1:
+                decision = 'amend'
+            contradict = directives.get('contradict') == name          # signs, yet still requires changes
+            answer = {{'decision': decision, 'reason': name + ' reasons', 'main_risk': 'overfitting',
+                      'falsifier': 'no gain on validation', 'first_step': 'run the ablation',
+                      'requested_changes': ['add a baseline'] if decision == 'amend' or contradict else [],
+                      'preferred_direction': 'something else' if decision == 'object' else ''}}
+        review, text = answer, json.dumps(answer)
     if name == 'agy':
         if mode == 'credits':
             sys.stderr.write('Error: Your AI credits balance is too low to continue.\\n')
@@ -931,7 +992,7 @@ class GeminiReviewer(Base):
         self.assertIsNone(xreview.agy_gate_problem(tree))
         original = xreview.agy_gate_command
         try:
-            xreview.agy_gate_command = lambda root: 'exit 3'
+            xreview.agy_gate_command = lambda root, web=False: 'exit 3'
             self.assertIn('did not answer', xreview.agy_gate_problem(tree))
         finally:
             xreview.agy_gate_command = original
@@ -1012,6 +1073,270 @@ class GeminiReviewer(Base):
         code, out = self.xr('doctor', '--reviewer', 'gemini', env={'FAKE_AGY_LOGIN': 'no'})
         self.assertEqual(code, 1, out)
         self.assertIn('not logged in', out)
+
+
+class Council(Base):
+    """Councils: rounds between fresh, isolated members, ending in a signed memo or a recorded split."""
+
+    def setUp(self):
+        super().setUp()
+        self.brief = self.tmp / 'brief.md'
+        self.brief.write_text('# Which baseline should we try next?\nThe current model overfits. Pick a direction.\n')
+
+    def council(self, *args, env=None, cwd=None):
+        return self.xr('council', 'run', '--brief-file', str(self.brief), *args, env=env, cwd=cwd)
+
+    def council_id(self, output):
+        for line in output.splitlines():
+            if line.startswith('Started council '):
+                return line.split()[2]
+        self.fail('no council id in output:\n' + output)
+
+    def council_calls(self, phase=None):
+        return [c for c in self.calls() if c.get('phase') and (phase is None or c['phase'] == phase)]
+
+    def test_consensus(self):
+        code, out = self.council(env={'FAKE_LOG_PROMPT': '1', 'CLAUDECODE': '1'})
+        self.assertEqual(code, 0, out)
+        self.assertIn(': consensus (3 of 3 members signed memo version 1; 3 rounds)', out)
+        self.assertIn('## Agreed direction (memo version 1)', out)
+        self.assertIn('every member signed memo version 1', out)
+        self.assertEqual([len(self.council_calls(p)) for p in ('proposals', 'critique', 'memo', 'signoff')],
+                         [3, 3, 1, 3])
+        for call in self.council_calls():
+            self.assertEqual(call['role'], 'reviewer')                  # members cannot start councils
+            self.assertIsNone(call['claudecode'])                       # a fresh session, not a nested one
+            for name in ('Claude', 'Codex', 'Gemini'):                 # members know each other by letter only
+                self.assertNotIn(name, call['prompt'])
+            self.assertFalse(Path(call['cwd']).exists())                # every copy is deleted afterwards
+        self.assertEqual(len({c['cwd'] for c in self.council_calls()}), 3)   # one copy per member
+        critique = self.council_calls('critique')[0]['prompt']
+        self.assertEqual(len(re.findall(r'^### Proposal [A-C]1: Plan from', critique, re.M)), 3)
+        job = Path(self.meta(self.council_id(out))['job_dir'])
+        transcript = (job / 'transcript.md').read_text()
+        self.assertIn('## Round 2: cross-critique', transcript)
+        self.assertIn('Plan from agy', transcript)
+        code, again = self.xr('show', self.council_id(out))
+        self.assertEqual(code, 0, again)
+        code, listing = self.xr('list')
+        self.assertIn('council', listing)
+
+    def test_no_consensus_stops_at_the_round_limit(self):
+        code, out = self.council('--rounds', '4', env={'FAKE_COUNCIL': 'object=agy'})
+        self.assertEqual(code, 2, out)
+        self.assertIn(': no_consensus (2 of 3 members signed memo version 2; 4 rounds)', out)
+        self.assertIn('Final memo, not agreed by all', out)
+        self.assertIn('objects.**', out)
+        self.assertIn('Prefers: something else', out)
+        self.assertEqual(len(self.council_calls('memo')), 2)
+        self.assertEqual(len(self.council_calls('signoff')), 6)
+
+    def test_requested_changes_go_back_to_the_drafter(self):
+        code, out = self.council(env={'FAKE_COUNCIL': 'amend_once=claude', 'FAKE_LOG_PROMPT': '1'})
+        self.assertEqual(code, 0, out)
+        self.assertIn('3 of 3 members signed memo version 2; 4 rounds', out)
+        revise = self.council_calls('memo')[1]['prompt']
+        self.assertIn('Requested change: add a baseline', revise)
+        second = [c for c in self.council_calls('signoff') if 'sign-off on version 2' in c['prompt']]
+        self.assertEqual(len(second), 3)
+        self.assertIn('Requested change: add a baseline', second[0]['prompt'])   # they see the earlier answers
+        self.assertIn('How the drafter answered the requested changes', out)
+
+    def test_a_member_that_fails_is_not_agreement(self):
+        code, out = self.council(env={'FAKE_MODE': 'credits'})       # Gemini runs out of credits
+        self.assertEqual(code, 2, out)
+        self.assertIn('Gemini left the council: round 1 (proposals)', out)
+        self.assertIn('credits balance is too low', out)
+        self.assertIn('no_consensus (2 of 3 members signed', out)
+        self.assertEqual(len(self.council_calls('signoff')), 2)
+        code, out = self.council('--members', 'codex,gemini', env={'FAKE_MODE': 'credits'})
+        self.assertEqual(code, 1, out)
+        self.assertIn('FAILED - fewer than two members answered round 1', out)
+        code, out = self.council(env={'FAKE_COUNCIL': 'fail=codex:critique'})
+        self.assertEqual(code, 2, out)
+        self.assertIn('Codex left the council: round 2 (cross-critique)', out)
+
+    def test_contradictory_or_incomplete_answers_are_rejected(self):
+        code, out = self.council(env={'FAKE_COUNCIL': 'contradict=claude'})
+        self.assertEqual(code, 2, out)                                  # no consensus despite three "sign"s
+        self.assertIn('Claude Code left the council: round 3 (sign-off)', out)
+        self.assertIn('"sign" with requested changes', out)
+        code, out = self.council(env={'FAKE_COUNCIL': 'partial=codex'})
+        self.assertEqual(code, 2, out)
+        self.assertIn("Codex left the council: round 2 (cross-critique)", out)
+        self.assertIn("every other member's proposal exactly once", out)
+
+    def test_the_top_ranked_member_drafts(self):
+        code, out = self.council(env={'FAKE_COUNCIL': 'prefer=codex'})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.council_calls('memo')[0]['name'], 'codex')
+        self.assertIn('drafted by Codex', out)
+        self.log.unlink()
+        code, out = self.council(env={'FAKE_COUNCIL': 'prefer=codex,fail=codex:memo'})
+        self.assertEqual(code, 2, out)                                 # the others agree, but not everyone
+        drafters = [c['name'] for c in self.council_calls('memo')]
+        self.assertEqual(drafters[0], 'codex')
+        self.assertIn(drafters[1], ('claude', 'agy'))
+        self.assertIn('Codex left the council: round 3 (drafting the memo)', out)
+        self.assertIn('2 of 3 members signed memo version 1', out)
+
+    def test_web_access_per_member(self):
+        code, out = self.council()
+        self.assertEqual(code, 0, out)
+        calls = {c['name']: c for c in self.council_calls('proposals')}
+        self.assertIn('web_search="cached"', calls['codex']['args'])
+        args = calls['claude']['args']
+        self.assertEqual(args[args.index('--tools') + 1], 'Read,Grep,Glob,WebSearch,WebFetch')
+        allowed = args[args.index('--allowedTools') + 1].split(',')
+        self.assertEqual(allowed[0], 'WebSearch')
+        self.assertIn('WebFetch(domain:arxiv.org)', allowed)
+        self.assertTrue(all(a == 'WebSearch' or re.match(r'^WebFetch\(domain:[a-z0-9.-]+\)$', a) for a in allowed))
+        self.assertIn('--restricted', args)
+        gate = calls['agy']['gate']
+        self.assertEqual((gate['web'], gate['shell'], gate['outside'], gate['inside']), ('allow', 'deny', 'deny', 'allow'))
+        self.log.unlink()
+        code, out = self.council('--no-web')
+        self.assertEqual(code, 0, out)
+        self.assertIn('web search off', out)
+        calls = {c['name']: c for c in self.council_calls('proposals')}
+        self.assertIn('web_search="disabled"', calls['codex']['args'])
+        args = calls['claude']['args']
+        self.assertEqual(args[args.index('--tools') + 1], 'Read,Grep,Glob')
+        self.assertNotIn('--allowedTools', args)
+        self.assertEqual(calls['agy']['gate']['web'], 'deny')
+        self.change()                                                  # reviews never search the web
+        code, out = self.xr('run', '--reviewer', 'gemini')
+        self.assertEqual(self.calls()[-1]['gate']['web'], 'deny')
+
+    def test_included_files_and_what_stays_out(self):
+        (self.repo / '.gitignore').write_text('results/\nscratch/\n')
+        self.git(self.repo, 'add', '.gitignore')
+        self.git(self.repo, 'commit', '-qm', 'ignore outputs')
+        (self.repo / 'results').mkdir()
+        (self.repo / 'results' / 'metrics.csv').write_text('split,acc\nval,0.91\n')
+        (self.repo / 'results' / '.env').write_text('TOKEN=1\n')
+        (self.repo / 'scratch').mkdir()
+        (self.repo / 'scratch' / 'notes.txt').write_text('not for the council\n')
+        code, out = self.council('--include', 'results')
+        self.assertEqual(code, 0, out)
+        self.assertIn('Left out of the included files (credential-like or private): results/.env', out)
+        for call in self.council_calls():
+            self.assertIn('results/metrics.csv', call['files'])
+            self.assertIn('stats.py', call['files'])
+            self.assertNotIn('results/.env', call['files'])
+            self.assertNotIn('scratch/notes.txt', call['files'])
+        code, out = self.xr('council', 'start', '--brief-file', str(self.brief), '--include', str(self.home))
+        self.assertEqual(code, 1, out)
+        self.assertIn('not inside', out)
+
+    def test_each_member_is_told_about_its_own_copy(self):
+        (self.repo / '.agents').mkdir()
+        (self.repo / '.agents' / 'hooks.json').write_text('{}')
+        self.git(self.repo, 'add', '.')
+        self.git(self.repo, 'commit', '-qm', 'repo agent config')
+        code, out = self.council(env={'FAKE_LOG_PROMPT': '1'})
+        self.assertEqual(code, 0, out)
+        prompts = {c['name']: c['prompt'] for c in self.council_calls('proposals')}
+        self.assertIn('agent configuration folders', prompts['agy'])          # left out of Gemini's copy only
+        self.assertNotIn('agent configuration folders', prompts['codex'])
+        self.assertNotIn('agent configuration folders', prompts['claude'])
+        files = {c['name']: c['files'] for c in self.council_calls('proposals')}
+        self.assertIn('.agents/hooks.json', files['codex'])
+        self.assertEqual(sorted(f for f in files['agy'] if f.startswith('.agents/')),
+                         ['.agents/hooks.json', '.agents/mcp_config.json'])   # xreview's own plumbing
+
+    def test_a_folder_that_is_not_a_repository(self):
+        folder = self.tmp / 'ideas'
+        folder.mkdir()
+        (folder / 'idea.md').write_text('an idea\n')
+        code, out = self.council('--repo', str(folder))
+        self.assertEqual(code, 0, out)
+        self.assertIn('is not a git repository, so the members see only the brief', out)
+        for call in self.council_calls():
+            self.assertEqual([f for f in call['files'] if not f.startswith('.agents/')], [])
+        self.log.unlink()
+        code, out = self.council('--repo', str(folder), '--include', str(folder / 'idea.md'))
+        self.assertEqual(code, 0, out)
+        self.assertIn('idea.md', self.council_calls()[0]['files'])
+
+    def test_followup_carries_the_previous_memo(self):
+        code, out = self.council()
+        first = self.council_id(out)
+        self.log.unlink()
+        code, out = self.council('--followup', env={'FAKE_LOG_PROMPT': '1'})
+        self.assertEqual(code, 0, out)
+        self.assertIn('Follows up council ' + first, out)
+        self.assertIn('follows up an earlier one ({})'.format(first), self.council_calls()[0]['prompt'])
+        self.change()
+        code, out = self.xr('start', '--reviewer', 'codex', '--followup', first)
+        self.assertEqual(code, 1, out)
+        self.assertIn('is a council, not a review', out)
+
+    def test_cancel_stops_every_member(self):
+        code, out = self.xr('council', 'start', '--brief-file', str(self.brief), env={'FAKE_MODE': 'sleep60'})
+        self.assertEqual(code, 0, out)
+        job_id = self.council_id(out)
+        for _ in range(100):
+            if len(self.council_calls()) >= 3:
+                break
+            time.sleep(0.2)
+        code, out = self.xr('cancel', job_id)
+        self.assertIn('Cancelled council', out)
+        meta = self.meta(job_id)
+        self.assertEqual((meta['status'], meta['reason']), ('failed', 'cancelled'))
+        for call in self.council_calls():
+            with self.assertRaises(ProcessLookupError):
+                os.kill(call['pid'], 0)
+        code, out = self.xr('wait', job_id)
+        self.assertEqual(code, 1, out)
+        self.assertIn('XCOUNCIL {}: FAILED - cancelled'.format(job_id), out)
+
+    def test_an_unconfined_member_does_not_take_part(self):
+        code, out = self.council(env={'FAKE_SANDBOX': 'open'})       # Codex's shell could read outside
+        self.assertEqual(code, 2, out)
+        self.assertIn('Codex left the council: could not take part: Codex could not confine its shell', out)
+        self.assertNotIn('codex', [c['name'] for c in self.council_calls()])
+
+    def test_guards_and_settings(self):
+        code, out = self.xr('council', 'start', '--brief-file', str(self.brief), env={'XREVIEW_ROLE': 'reviewer'})
+        self.assertEqual(code, 1, out)
+        self.assertIn('disabled inside a reviewer or council member', out)
+        code, out = self.xr('council', 'start', '--brief', '   ')
+        self.assertIn('give the council a brief', out)
+        code, out = self.xr('council', 'start', '--brief-file', str(self.brief), '--members', 'claude')
+        self.assertIn('at least two members', out)
+        code, out = self.xr('council', 'start', '--brief-file', str(self.brief), '--rounds', '2')
+        self.assertIn('--rounds must be from 3 to 10', out)
+        for council, message in (({'members': ['claude']}, 'at least two of'), ({'rounds': 11}, 'whole number'),
+                                 ({'web': 'yes'}, 'true or false'),
+                                 ({'fetch_hosts': ['https://arxiv.org']}, 'host names')):
+            self.write_config(council=council)
+            code, out = self.xr('council', 'start', '--brief-file', str(self.brief))
+            self.assertEqual(code, 1, out)
+            self.assertIn(message, out)
+        self.write_config(gemini={'bin': None}, council={'members': ['claude', 'codex', 'gemini']})
+        (self.tmp / 'fakes' / 'agy').rename(self.tmp / 'agy-away')
+        code, out = self.council()
+        self.assertEqual(code, 0, out)                                # Gemini is optional by default
+        self.assertIn('Gemini is not set up on this machine, so it is not a member', out)
+        self.assertIn('2 of 2 members signed', out)
+
+    def test_gate_web_mode(self):
+        root = self.tmp / 'copy'
+        root.mkdir()
+        def decide(tool, args, *flags):
+            payload = json.dumps({'toolCall': {'name': tool, 'args': args}})
+            proc = subprocess.run([sys.executable, str(SCRIPT), '_agy_gate', str(root)] + list(flags), input=payload,
+                                  stdout=subprocess.PIPE, universal_newlines=True, timeout=60)
+            return json.loads(proc.stdout)['decision']
+        self.assertEqual(decide('search_web', {'query': 'echo segmentation'}, '--web'), 'allow')
+        self.assertEqual(decide('search_web', {'query': 'x', 'Url': 'https://evil.example'}, '--web'), 'deny')
+        self.assertEqual(decide('search_web', {'query': ''}, '--web'), 'deny')
+        self.assertEqual(decide('read_url_content', {'Url': 'https://arxiv.org/abs/1'}, '--web'), 'deny')
+        self.assertEqual(decide('run_command', {'CommandLine': 'ls'}, '--web'), 'deny')
+        self.assertEqual(decide('search_web', {'query': 'x'}), 'deny')
+        self.assertIsNone(xreview.agy_gate_problem(root, web=True))
+        self.assertIsNone(xreview.agy_gate_problem(root))
 
 
 class PathPatterns(unittest.TestCase):

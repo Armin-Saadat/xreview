@@ -38,6 +38,14 @@ from this repository.
   has no read-only mode, xreview confines it with a hook that allows only reading
   the review copy and xreview's own read-only tools, and blocks everything else
   ([details](skills/xreview/references/setup.md#what-the-reviewer-can-do)).
+- **Councils for decisions without a diff.** Ask for a council to have Claude
+  Code, Codex and Gemini brainstorm, plan next steps or read results together: they
+  propose independently, critique each other's proposals anonymously, and revise a
+  joint memo until every member signs it or the round limit records the dissent.
+  Members get the same read-only isolation as reviewers, plus web search
+  ([details](skills/xreview/references/setup.md#councils)). In the trigger evals,
+  Claude convened a council in 3 of 3 runs when asked to brainstorm with the other
+  agents, and in none of 3 for a question it could answer itself.
 - **Reviews run in the background**, so no agent's command timeout kills them.
   Answers must match a JSON schema. A crash, timeout, malformed answer or
   `cannot_review` is never treated as an approval.

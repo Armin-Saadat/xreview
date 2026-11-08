@@ -10,6 +10,7 @@
 - [Configuration](#configuration)
 - [Project review rules](#project-review-rules)
 - [What is sent and stored](#what-is-sent-and-stored)
+- [Councils](#councils)
 - [Troubleshooting](#troubleshooting)
 
 ## Requirements
@@ -184,6 +185,64 @@ first 64 KB. Use it for invariants a reviewer cannot infer, for example:
   `review.json` and `meta.json` (including the model the CLI reports it used). The
   review copy is deleted when the review ends.
 
+## Councils
+
+`xreview.py council start --brief-file <brief>` (the `council` skill) has fresh
+sessions of Claude Code, Codex and Gemini deliberate on a question without a diff:
+brainstorming, planning, reading results, choosing a research direction.
+
+1. **Proposals.** Each member proposes one to three directions without seeing the
+   others.
+2. **Cross-critique.** Each member critiques every proposal and ranks the other
+   members' ones. Proposals carry member letters, never model names, so no member
+   defers to a brand or favours its own.
+3. **Memo and sign-off.** The member whose proposal ranked best drafts a joint memo:
+   direction, plan, risks, results that would show it wrong, alternatives and open
+   questions. Every member signs it, asks for specific changes or objects, and the
+   drafter revises, until every member signs the same version or the round limit
+   (default 5) is reached. Then the result shows the final memo and the dissent.
+
+Members are fresh sessions that cannot start reviews or councils, and they work like
+reviewers: each in its own read-only copy of the project (what git would commit,
+minus credential-like and `private` paths), with the same confinement as in
+[What the reviewer can do](#what-the-reviewer-can-do). `--include` adds files or
+folders that git ignores, such as results and logs, for that council only;
+credential-like and private files among them are refused. Outside a git repository,
+members get only the brief and the included files.
+
+With web search on (the default; `--no-web`, or `"web": false` in the configuration,
+turns it off):
+
+| Member | Web access |
+|---|---|
+| Codex | Codex's web search in cached mode, which searches OpenAI's index; Codex fetches no pages itself, and its shell still has no network |
+| Claude Code | `WebSearch`, and `WebFetch` for pages on the hosts in `fetch_hosts` only (exact host names: `arxiv.org` does not cover `export.arxiv.org`); every other fetch is refused |
+| Gemini | agy's `search_web`, allowed by the gate; it cannot open URLs |
+
+So a page that tries to talk a member into sending your results somewhere can
+reach only the search providers and the listed research sites. Search queries go to
+the providers, so with web search on, details of unpublished work can reach them.
+
+A council of three makes 10 to 18 calls (three to five rounds) and usually takes
+10 to 25 minutes. It uses every member's quota, including Antigravity credits. Each
+job folder keeps the brief, every prompt and answer (`calls/`), `council.md` (what
+`show` prints) and `transcript.md` (the whole discussion, with model names). Gemini
+members' sessions are saved in your agy conversation history, as reviews are.
+
+Settings, in the same configuration file:
+
+```json
+{
+  "council": {"members": ["claude", "codex", "gemini"], "rounds": 5, "web": true,
+              "fetch_hosts": ["arxiv.org", "openreview.net", "pubmed.ncbi.nlm.nih.gov"]}
+}
+```
+
+Setting `fetch_hosts` replaces the default list (research and preprint sites, journals,
+GitHub, Hugging Face and library documentation); `xreview.py council start --help`
+lists the other options. Members use the reviewer models above. Gemini is optional:
+when agy is not set up, the default council has two members.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
@@ -198,6 +257,8 @@ first 64 KB. Use it for invariants a reviewer cannot infer, for example:
 | `.xreview.json is not valid JSON`, `unknown key`, `negated patterns are not supported` | Fix `.xreview.json`; xreview will not review without knowing what is private |
 | Gemini: `the Antigravity CLI is not logged in`, or `authentication failed` | Run `agy` once in a terminal on that machine and finish the Google sign-in |
 | Gemini: `Your AI credits balance is too low to continue` | The Antigravity account is out of AI credits. Wait for them to refill, or choose a cheaper model such as `"gemini": {"model": "gemini-3.8-flash"}` |
+| Council: `<member> left the council: ...` | That member's call failed (see the reason, for example an expired login or no credits). The council went on without it, and the result is at best `no_consensus` |
+| Council: `FAILED - fewer than two members ...` | A council needs at least two members; check each with `doctor --reviewer <name>` |
 | Gemini: `the Gemini review gate failed its check` | The hook that keeps agy read-only could not run (for example the Python that runs xreview moved), so the review did not start. `doctor --reviewer gemini` shows why |
 | `running inside the Codex sandbox` | Re-run `start` with escalated permissions |
 | `Operation not permitted` writing `~/.local/share/xreview` | The shell is sandboxed; run `start` outside the sandbox |

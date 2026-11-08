@@ -1,9 +1,9 @@
 # xreview maintenance instructions
 
-This repository is the `xreview` plugin: one skill that installs in both
-**Claude Code** and **Codex** from one GitHub repository. These instructions are
-for anyone (human or agent) editing the repository itself; they are not loaded
-into projects that install the plugin.
+This repository is the `xreview` plugin: two skills, `xreview` (reviews) and
+`council` (deliberation), that install in both **Claude Code** and **Codex** from
+one GitHub repository. These instructions are for anyone (human or agent) editing
+the repository itself; they are not loaded into projects that install the plugin.
 
 ## Layout
 
@@ -13,6 +13,7 @@ into projects that install the plugin.
 | `skills/xreview/references/setup.md` | Setup, configuration and troubleshooting, loaded on demand |
 | `skills/xreview/scripts/xreview.py` | The tool the skill runs: diff collection, reviewer launch, results |
 | `skills/xreview/agents/openai.yaml` | Codex UI metadata (`display_name`, `short_description`, `default_prompt`) |
+| `skills/council/` | The `council` skill: Claude, Codex and Gemini deliberate and sign off; it runs `../xreview/scripts/xreview.py council` |
 | `plugin.json` | Portable/Codex manifest; Codex caches installs by its `version` |
 | `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` | Claude Code manifest and marketplace (no `version`, so Claude tracks commits) |
 | `claude-hooks/` | Claude Code SessionStart hook that restates when to review; Claude picks skills by topic and otherwise rarely reviews its own work. Keep its wording in step with the skill description |
@@ -56,6 +57,12 @@ into projects that install the plugin.
   folder, and the repository's own agent configuration folders out of it: agy runs
   workspace hooks and MCP servers without asking. The gate allows only reads inside
   the copy, xreview's repository tools and the final answer; anything new denies.
+- Council members are reviewers in this respect too: fresh sessions with
+  `XREVIEW_ROLE=reviewer`, each in its own copy, under the same confinement. Web
+  access stays with the providers' search tools (Codex `web_search="cached"`, agy
+  `search_web` through the gate's `--web` mode) and Claude's `WebFetch` on the exact
+  `fetch_hosts`; never a shell with network. A failed or missing answer is never a
+  signature.
 - Never print or send credentials. Extend `SECRET_GLOBS` rather than special-casing.
 - Every behaviour change gets a test in `tests/test_xreview.py`. Use the fake CLI
   (`FAKE_MODE`) rather than real model calls.

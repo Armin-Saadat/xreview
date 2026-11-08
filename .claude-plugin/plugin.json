@@ -1,6 +1,6 @@
 {
   "name": "xreview",
-  "description": "Cross-agent code review: Codex reviews Claude Code's work and Claude Code reviews Codex's, read-only, from the real git diff, with checks for ML experiment validity.",
+  "description": "Cross-agent code review and councils: Codex and Claude Code review each other's work read-only from the real git diff, with checks for ML experiment validity, and Claude, Codex and Gemini can deliberate on plans and results until they sign off on a direction.",
   "author": {
     "name": "Armin Saadat"
   },

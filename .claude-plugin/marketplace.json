@@ -6,7 +6,7 @@
     {
       "name": "xreview",
       "source": "./",
-      "description": "Have Codex review Claude Code's work and Claude Code review Codex's, read-only, from the real git diff.",
+      "description": "Have Codex review Claude Code's work and Claude Code review Codex's, read-only, from the real git diff; convene Claude, Codex and Gemini to deliberate on plans and results.",
       "category": "development",
       "keywords": ["code-review", "codex", "claude-code", "second-opinion", "ml-experiments"]
     }
