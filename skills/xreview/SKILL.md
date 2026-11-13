@@ -34,6 +34,9 @@ the user asks; skip when they say so.
    - Gemini can review instead when the user asks for it: add `--reviewer gemini`.
      It runs through Google's Antigravity CLI (`agy`), which must be installed and
      logged in, and it never reviews unless asked.
+   - A Claude Code reviewer uses its Claude login unless the machine is set to an
+     API key. If the user asks for this review to use their API key (or the login),
+     add `--claude-auth api-key` (or `login`).
    - Work that is already committed: add `--base <branch-or-commit>`.
    - To review one piece of a larger change early, add `--paths <files or folders>`.
      The result then says `(partial)`; the rest stays readable as context, and the

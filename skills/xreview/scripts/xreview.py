@@ -36,7 +36,7 @@ import tempfile
 import threading
 import time
 
-VERSION = '0.8.1'
+VERSION = '0.9.0'
 REVIEWERS = ('codex', 'claude', 'gemini')
 NAMES = {'codex': 'Codex', 'claude': 'Claude Code', 'gemini': 'Gemini'}
 # The command behind each reviewer. Gemini reviews run through Google's Antigravity
@@ -52,7 +52,12 @@ DEFAULT_CONFIG = {
     # tools: true = Codex's sandboxed shell; "repo" = xreview's read-only repository
     # tools, for hosts where Codex's sandbox cannot start; false = diff only.
     'codex': {'bin': None, 'model': 'gpt-6-astra', 'effort': 'medium', 'tools': True},
-    'claude': {'bin': None, 'model': 'claude-opus-5-5', 'effort': 'high'},
+    # auth: "login" = the Claude login Claude Code already has; "api-key" = an Anthropic API key,
+    # read from api_key_file (chmod 600), or from the environment variable api_key_env if set.
+    # api_model and api_effort replace model and effort when the API key is used (null: the same).
+    'claude': {'bin': None, 'model': 'claude-opus-5-5', 'effort': 'high', 'auth': 'login',
+               'api_key_file': '~/.config/xreview/anthropic-api-key', 'api_key_env': None,
+               'api_model': None, 'api_effort': None},
     'gemini': {'bin': None, 'model': 'gemini-4-argon', 'effort': 'high'},
     # Councils: who takes part, the round limit, and web access. A member is
     # AGENT[:MODEL][@EFFORT], such as "codex:gpt-6.1-sol@high"; without a model or effort
@@ -303,6 +308,19 @@ def load_config():
     tools = cfg['codex'].get('tools', True)
     if not (isinstance(tools, bool) or tools == 'repo'):
         raise Fail('"codex": {{"tools": ...}} in {} must be true, "repo" or false'.format(path))
+    claude = cfg['claude']
+    if claude.get('auth') not in CLAUDE_AUTHS:
+        raise Fail('"claude": {{"auth": ...}} in {} must be "login" or "api-key"'.format(path))
+    if not isinstance(claude.get('api_key_file'), str) or not claude['api_key_file'].strip():
+        raise Fail('"claude": {{"api_key_file": ...}} in {} must be a file path'.format(path))
+    env_name = claude.get('api_key_env')
+    if env_name is not None and not (isinstance(env_name, str) and ENV_NAME_RE.match(env_name)):
+        raise Fail('"claude": {{"api_key_env": ...}} in {} must be null or an environment variable name'.format(path))
+    for key in ('api_model', 'api_effort'):
+        value = claude.get(key)
+        if value is not None and not (isinstance(value, str) and value.strip() and not value.startswith('-')):
+            raise Fail('"claude": {{"{}": ...}} in {} must be null or a name such as "claude-fable-5-2" or "high"'.format(
+                key, path))
     council = cfg['council']
     members = council.get('members')
     if not isinstance(members, list) or len(members) < 2:
@@ -329,6 +347,94 @@ def load_config():
         raise Fail('"council": {{"fetch_hosts": ...}} in {} must be a list of host names such as '
                    '"arxiv.org"'.format(path))
     return cfg
+
+
+CLAUDE_AUTHS = ('login', 'api-key')
+ENV_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+# Anthropic credentials in the user's environment. They reach no reviewer or council member,
+# except the key xreview reads for a Claude Code process set to "api-key".
+ANTHROPIC_CREDENTIAL_ENV = ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN')
+
+
+def claude_api_key(options):
+    """The Anthropic API key of a Claude Code reviewer or member with "auth": "api-key". It is read
+    each time it is needed and never stored or printed."""
+    env_name = options.get('api_key_env')
+    if env_name:
+        key = os.environ.get(env_name, '').strip()
+        if not key:
+            raise Fail('Claude Code is set to use an API key from ${}, which is not set here. Commands '
+                       'that Codex runs do not see variables named like *KEY*; keep the key in a file '
+                       '("api_key_file") instead'.format(env_name))
+        return key
+    path = Path(os.path.expanduser(options.get('api_key_file') or DEFAULT_CONFIG['claude']['api_key_file']))
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        raise Fail('Claude Code is set to use an API key, but {} does not exist: save your Anthropic API key '
+                   'there and run `chmod 600 {}`'.format(path, path))
+    if mode & 0o077:
+        raise Fail('{} holds an API key but other users can read it; run `chmod 600 {}`'.format(path, path))
+    try:
+        key = path.read_text(encoding='utf-8').strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise Fail('could not read the API key in {}: {}'.format(path, exc))
+    if not key or len(key.split()) != 1:
+        raise Fail('{} must hold just the API key'.format(path))
+    return key
+
+
+def claude_settings(options, auth=None):
+    """A Claude Code reviewer's or member's settings for one run: `auth` (from --claude-auth)
+    replaces the configured sign-in, and with an API key api_model and api_effort, when set,
+    replace model and effort."""
+    options = dict(options)
+    if auth:
+        options['auth'] = auth
+    if options.get('auth') == 'api-key':
+        for key in ('model', 'effort'):
+            if options.get('api_' + key):
+                options[key] = options['api_' + key]
+    return options
+
+
+def claude_auth_label(options):
+    """Where a Claude Code reviewer or member signs in from, for reports (never the key itself)."""
+    if options.get('auth') != 'api-key':
+        return 'Claude login'
+    if options.get('api_key_env'):
+        return 'API key from ${}'.format(options['api_key_env'])
+    return 'API key from {}'.format(options.get('api_key_file'))
+
+
+def secret_env_names(cfg):
+    """Variables that hold a key xreview reads itself; no reviewer or member inherits them."""
+    return [name for name in [cfg['claude'].get('api_key_env')] if name]
+
+
+def agent_env(agent, options, base, config_dir=None, drop=()):
+    """The environment of one reviewer or council member process.
+
+    Codex and Gemini never get Anthropic credentials; a Claude Code process on its login runs
+    with the environment as before. A Claude Code process on an API key gets the key and its
+    own empty configuration folder, `config_dir`: Claude Code then finds no login to fall back
+    on (checked: with a wrong key it fails "Invalid API key", without one "Not logged in"),
+    and loads none of the user's settings, hooks or plugins, while keeping Read, Grep and Glob
+    (--bare would also force the key, but leaves only Read). It also starts without the
+    calling session's CLAUDE* variables (the desktop app's CLAUDE_CODE_ENTRYPOINT, for one,
+    makes API-key requests fail with "Credit balance is too low") and without any other
+    ANTHROPIC_* variable, such as ANTHROPIC_BASE_URL, so the key goes to Anthropic only."""
+    env = {k: v for k, v in base.items() if k not in drop}
+    api = agent == 'claude' and options.get('auth') == 'api-key'
+    if agent != 'claude' or api:
+        env = {k: v for k, v in env.items() if k not in ANTHROPIC_CREDENTIAL_ENV}
+    if api:
+        if config_dir is None:
+            raise Fail('internal error: an API-key Claude Code process needs its own config folder')
+        env = {k: v for k, v in env.items() if not k.startswith(('CLAUDE', 'ANTHROPIC_'))}
+        env['CLAUDE_CONFIG_DIR'] = str(config_dir)
+        env['ANTHROPIC_API_KEY'] = claude_api_key(options)
+    return env
 
 
 def codex_mode(reviewer, options):
@@ -898,11 +1004,19 @@ def agy_gate_problem(root, web=False):
     return None
 
 
+def job_auth(meta):
+    """How a job's Claude Code reviewer signed in (reviews before 0.9 used the login)."""
+    if meta.get('reviewer') != 'claude':
+        return None
+    return (meta.get('auth') or {}).get('auth') or 'login'
+
+
 def remove_copy(job):
-    for name in ('tree', 'trees'):              # a review's copy; a council's, one per member
-        tree = Path(job) / name
-        if tree.is_dir():
-            shutil.rmtree(str(tree), ignore_errors=True)
+    folders = [Path(job) / name for name in ('tree', 'trees', 'claude-config')]   # copies; an API-key config
+    folders += list(Path(job).glob('calls/*/claude-config'))                     # a council call's config
+    for folder in folders:
+        if folder.is_dir():
+            shutil.rmtree(str(folder), ignore_errors=True)
 
 
 def load_project_rules(repo, policy):
@@ -1246,6 +1360,7 @@ def agent_command(agent, binary, options, root, schema, schema_file, output_file
     # the working directory (the review copy); no settings files, hooks, MCP servers,
     # skills or saved session. With web access, WebSearch, and WebFetch limited to the
     # listed hosts: in dontAsk mode every other fetch is refused.
+    # (An API-key sign-in is set up in the environment: agent_env.)
     tools = 'Read,Grep,Glob' + (',WebSearch,WebFetch' if web else '')
     cmd = [binary, '-p', '--restricted', '--tools', tools, '--strict-mcp-config',
            '--permission-mode', 'dontAsk', '--no-session-persistence', '--disable-slash-commands',
@@ -1398,11 +1513,16 @@ def cmd_start(args, wait_after=False):
                    'no network access. Re-run `xreview start` outside the sandbox (request '
                    'escalated permissions).')
     cfg = load_config()
-    options = dict(cfg[reviewer])
+    claude_auth = getattr(args, 'claude_auth', None)
+    if claude_auth and reviewer != 'claude':
+        raise Fail('--claude-auth applies to Claude Code reviews; this one is by {}'.format(NAMES[reviewer]))
+    options = claude_settings(cfg[reviewer], claude_auth) if reviewer == 'claude' else dict(cfg[reviewer])
     if args.model:
         options['model'] = args.model
     if args.effort:
         options['effort'] = args.effort
+    if reviewer == 'claude' and options.get('auth') == 'api-key':
+        claude_api_key(options)
     binary = find_binary(reviewer, cfg)
 
     top = git(Path(args.repo).expanduser(), 'rev-parse', '--show-toplevel', check=False)
@@ -1455,8 +1575,9 @@ def cmd_start(args, wait_after=False):
                 continue
             meta = refresh(meta)
             same = (meta.get('digest') == digest and
-                    (meta.get('model'), meta.get('effort'), meta_mode(meta)) ==
-                    (options.get('model'), options.get('effort'), mode))
+                    (meta.get('model'), meta.get('effort'), meta_mode(meta), job_auth(meta)) ==
+                    (options.get('model'), options.get('effort'), mode,
+                     options.get('auth') if reviewer == 'claude' else None))
             if not same:
                 continue
             if meta.get('status') in ('queued', 'running'):
@@ -1514,6 +1635,8 @@ def cmd_start(args, wait_after=False):
         'followup_of': previous['meta']['id'] if previous else None,
         'model': options.get('model'), 'effort': options.get('effort'), 'diff_only': without_tools,
         'codex_mode': mode,
+        'auth': {k: options.get(k) for k in ('auth', 'api_key_file', 'api_key_env')} if reviewer == 'claude' else None,
+        'drop_env': secret_env_names(cfg),
         'command': command, 'timeout_minutes': cfg['timeout_minutes'], 'created': iso(created),
     }
     write_json(job / 'meta.json', meta)
@@ -1744,6 +1867,8 @@ def render(meta, review):
                  meta['target'], meta['repo'], meta['branch'], (meta.get('head') or 'none')[:12]),
              '- Model: {}{}{}'.format(model, ', effort ' + effort if effort else '',
                                       ', sandbox ' + reported['sandbox'] if reported.get('sandbox') else '')]
+    if (meta.get('auth') or {}).get('auth') == 'api-key':
+        lines.append('- Sign-in: ' + claude_auth_label(meta['auth']))
     if (meta.get('round') or 1) > 1:
         lines.append('- Round {}: follows up review {}'.format(meta['round'], meta.get('followup_of')))
     if meta.get('paths'):
@@ -1815,9 +1940,17 @@ def run_worker(job, started):
 
     meta.update(status='running', started=iso(started), worker_pid=os.getpid())
     write_json(job / 'meta.json', meta)
-    env = dict(os.environ, XREVIEW_ROLE='reviewer')
     prompt = (job / 'prompt.md').read_text(encoding='utf-8')
     reason, review = None, None
+    auth = meta.get('auth') or {}
+    config_dir = job / 'claude-config' if auth.get('auth') == 'api-key' else None
+    try:
+        if config_dir is not None:
+            config_dir.mkdir(mode=0o700, exist_ok=True)
+        env = agent_env(meta['reviewer'], auth, dict(os.environ, XREVIEW_ROLE='reviewer'), config_dir,
+                        meta.get('drop_env') or ())
+    except (Fail, OSError) as exc:
+        env, reason = None, 'the review did not run: {}'.format(exc)
     if meta.get('copy') is not None and meta_mode(meta) == 'shell':
         # Fail closed if this Codex would not keep its shell inside the review copy.
         problem = codex_confinement_problem(meta['command'][0], meta['review_root'])
@@ -2183,7 +2316,7 @@ def parse_member(spec):
     return agent, match.group(2), match.group(3)
 
 
-def council_members(specs, cfg):
+def council_members(specs, cfg, claude_auth=None):
     """[(member, agent, options)] for the specs, in order. An agent may take part several times:
     its first member is named after it ("codex"), later ones are numbered ("codex-2"). A model
     or effort in the spec replaces the agent's reviewer setting."""
@@ -2191,7 +2324,7 @@ def council_members(specs, cfg):
     for spec in specs:
         agent, model, effort = parse_member(spec)
         seen[agent] += 1
-        options = dict(cfg[agent])
+        options = claude_settings(cfg[agent], claude_auth) if agent == 'claude' else dict(cfg[agent])
         if model:
             options['model'] = model
         if effort:
@@ -2549,7 +2682,7 @@ def cmd_council(args, wait_after=False):
         raise Fail('the brief is over {} KB; summarize it, and --include the files the members should '
                    'read'.format(MAX_BRIEF_BYTES // 1024))
     specs = [m.strip() for m in args.members.split(',')] if args.members else list(ccfg['members'])
-    wanted = council_members([m for m in specs if m], cfg)
+    wanted = council_members([m for m in specs if m], cfg, args.claude_auth)
     rounds = args.rounds or ccfg['rounds']
     if not MIN_COUNCIL_ROUNDS <= rounds <= MAX_COUNCIL_ROUNDS:
         raise Fail('--rounds must be from {} to {}'.format(MIN_COUNCIL_ROUNDS, MAX_COUNCIL_ROUNDS))
@@ -2570,6 +2703,12 @@ def cmd_council(args, wait_after=False):
     if len(members) < 2:
         raise Fail('a council needs at least two members; available here: {}'.format(
             ', '.join(NAMES[agents[m]] for m in members) or 'none'))
+    claude_members = [m for m in members if agents[m] == 'claude']
+    if args.claude_auth and not claude_members:
+        raise Fail('--claude-auth applies to Claude Code members, and this council has none')
+    for m in claude_members:
+        if options[m].get('auth') == 'api-key':
+            claude_api_key(options[m])
 
     # A git repository gets a project copy; any other folder only the files included.
     base = Path(args.repo).expanduser()
@@ -2625,6 +2764,7 @@ def cmd_council(args, wait_after=False):
         'kind': 'council', 'id': job_id, 'job_dir': str(job), 'version': VERSION, 'status': 'queued',
         'members': members, 'agents': agents, 'labels': labels, 'binaries': binaries, 'options': options,
         'max_proposals': council_max_proposals(len(members)), 'parallel_per_agent': ccfg['parallel_per_agent'],
+        'drop_env': secret_env_names(cfg),
         'rounds_max': rounds, 'web': web,
         'fetch_hosts': list(ccfg['fetch_hosts']) if web else [], 'repo': str(repo), 'is_git': is_git,
         'branch': branch, 'head': head, 'git_dir': git_dir, 'trees': trees, 'copy': copy, 'copies': copies,
@@ -2798,14 +2938,26 @@ class CouncilRun:
             if cancelled:
                 kill_group(proc)
 
-        slot = self.slots[agent]
-        while not slot.acquire(timeout=1):      # another member of this agent is answering
-            if self.cancelled:
-                return None, 'cancelled', False
+        options = meta['options'][member]
+        config_dir = call_dir / 'claude-config' if agent == 'claude' and options.get('auth') == 'api-key' else None
         try:
-            error = run_agent(cmd, tree, stdin_text, meta['timeout_minutes'] * 60, call_dir, self.env, register)
+            try:
+                if config_dir is not None:
+                    config_dir.mkdir(mode=0o700, exist_ok=True)
+                env = agent_env(agent, options, self.env, config_dir, meta.get('drop_env') or ())
+            except (Fail, OSError) as exc:
+                return None, str(exc), False
+            slot = self.slots[agent]
+            while not slot.acquire(timeout=1):      # another member of this agent is answering
+                if self.cancelled:
+                    return None, 'cancelled', False
+            try:
+                error = run_agent(cmd, tree, stdin_text, meta['timeout_minutes'] * 60, call_dir, env, register)
+            finally:
+                slot.release()
         finally:
-            slot.release()
+            if config_dir is not None:
+                shutil.rmtree(str(config_dir), ignore_errors=True)
         stdout_text = (call_dir / 'stdout.txt').read_text(encoding='utf-8', errors='replace')
         reported = reported_settings(agent, call_dir, stdout_text, stderr_name='stderr.txt')
         with self.lock:
@@ -3012,7 +3164,8 @@ def render_council(meta, result):
     def model(m):
         options = meta['options'][m]
         name = (reported.get(m) or {}).get('model') or options.get('model') or 'CLI default'
-        return name + (', effort ' + options['effort'] if options.get('effort') else '')
+        return name + (', effort ' + options['effort'] if options.get('effort') else '') + (
+            ', ' + claude_auth_label(options) if member_agent(meta, m) == 'claude' and options.get('auth') == 'api-key' else '')
 
     lines = ['# Council {}: {}'.format(meta['id'], 'consensus' if consensus else 'no consensus'), '',
              '- Question: ' + meta.get('title', ''),
@@ -3170,7 +3323,7 @@ def cmd_doctor(args):
             continue
         version = run_quiet([binary, '--version'])
         print('  ok   {} ({})'.format(binary, version.strip().splitlines()[0] if version.strip() else 'version unknown'))
-        options = cfg[reviewer]
+        options = claude_settings(cfg[reviewer]) if reviewer == 'claude' else cfg[reviewer]
         print('  ...  reviews request model {}, effort {}'.format(
             options.get('model') or 'CLI default', options.get('effort') or 'CLI default'))
         if reviewer == 'codex':
@@ -3239,8 +3392,17 @@ def cmd_doctor(args):
             if problem:
                 print('  FAIL xreview\'s repository tools did not respond: ' + problem)
                 ok = False
+        elif options.get('auth') == 'api-key':
+            try:
+                claude_api_key(options)
+                print('  ok   Claude Code reviews and council members use your Anthropic API key ({}; billed '
+                      'per token, not to your Claude login)'.format(claude_auth_label(options)))
+            except Fail as exc:
+                print('  FAIL ' + str(exc))
+                ok = False
         else:
-            status = run_quiet([binary, 'auth', 'status'])
+            status = run_quiet([binary, 'auth', 'status'], env=agent_env('claude', options, os.environ,
+                                                                          drop=secret_env_names(cfg)))
             try:
                 logged_in = json.loads(status).get('loggedIn')
             except ValueError:
@@ -3324,7 +3486,8 @@ def live_check(reviewer, without_tools=False):
         print('  ...  running a real {} review of a planted bug (uses a little of your quota)'.format(NAMES[reviewer]))
         ns = argparse.Namespace(reviewer=reviewer, repo=str(repo), base=None,
                                 intent='Tidy up mean().' if without_tools else 'Add hit_rate() for the cache dashboard.',
-                                intent_file=None, model=None, effort=None, force=True, paths=None, followup=None)
+                                intent_file=None, model=None, effort=None, force=True, paths=None, followup=None,
+                                claude_auth=None)
         env_backup = {k: os.environ.pop(k) for k in ('CLAUDECODE', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID',
                                                      'ANTIGRAVITY_CONVERSATION_ID')
                       if k in os.environ}
@@ -3692,6 +3855,8 @@ def main(argv=None):
         p.add_argument('--intent-file', help='read the notes from a file instead')
         p.add_argument('--model', help='reviewer model for this review')
         p.add_argument('--effort', help='reviewer reasoning effort for this review')
+        p.add_argument('--claude-auth', choices=CLAUDE_AUTHS,
+                       help='how a Claude Code reviewer signs in for this review: its login, or your API key')
         p.add_argument('--force', action='store_true', help='review even if this diff was already reviewed')
         p.add_argument('--paths', nargs='+', metavar='PATH',
                        help='review only the changes under these files or folders (a partial review)')
@@ -3703,6 +3868,8 @@ def main(argv=None):
     def add_council_args(p):
         p.add_argument('--brief', help='the question and its context, as text')
         p.add_argument('--brief-file', help='read the brief from a file (- for stdin)')
+        p.add_argument('--claude-auth', choices=CLAUDE_AUTHS,
+                       help='how Claude Code members sign in for this council: their login, or your API key')
         p.add_argument('--members', help='comma-separated members, each AGENT[:MODEL][@EFFORT] such as '
                        'codex:gpt-6.1-sol@high; an agent may appear more than once (default: claude,codex,gemini)')
         p.add_argument('--rounds', type=int, help='round limit, {} to {} (default 5)'.format(

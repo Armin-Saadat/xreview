@@ -11,6 +11,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent.parent / 'skills' / 'xreview' / 'scripts' / 'xreview.py'
 _spec = importlib.util.spec_from_file_location('xreview_module', str(SCRIPT))
@@ -98,7 +99,15 @@ FAKE = textwrap.dedent('''\
         record = {{'args': args, 'role': os.environ.get('XREVIEW_ROLE'), 'cwd': os.getcwd(),
                   'files': files, 'pid': os.getpid(), 'prompt_len': len(prompt), 'name': name,
                   'who': who, 'phase': phase, 'claudecode': os.environ.get('CLAUDECODE'),
-                  'again': 'could not be used' in prompt}}
+                  'again': 'could not be used' in prompt, 'bare': '--bare' in args,
+                  'config_dir': os.environ.get('CLAUDE_CONFIG_DIR'),
+                  'config_dir_empty': (os.listdir(os.environ['CLAUDE_CONFIG_DIR']) == []
+                                       if os.path.isdir(os.environ.get('CLAUDE_CONFIG_DIR') or '') else None),
+                  'my_key': os.environ.get('MY_ANTHROPIC_KEY'),
+                  'base_url': os.environ.get('ANTHROPIC_BASE_URL'),
+                  'anthropic_key': os.environ.get('ANTHROPIC_API_KEY'),
+                  'auth_token': os.environ.get('ANTHROPIC_AUTH_TOKEN'),
+                  'entrypoint': os.environ.get('CLAUDE_CODE_ENTRYPOINT')}}
         if os.environ.get('FAKE_LOG_PROMPT'):
             record['prompt'] = prompt
         record.update(extra)
@@ -1458,7 +1467,8 @@ class Council(Base):
                      'codex@High', 'codex:gpt 6', 'codex:a@b@c', 'codex:gpt;rm', 'codex@-x', '', None, 5):
             with self.assertRaises(xreview.Fail, msg=repr(spec)):
                 parse(spec)
-        cfg = xreview.load_config()
+        with mock.patch.dict(os.environ, {'XREVIEW_CONFIG': str(self.config)}):  # not this machine's config
+            cfg = xreview.load_config()
         members = xreview.council_members(['codex', 'claude', 'codex:gpt-x', 'codex@low'], cfg)
         self.assertEqual([(m, a, o.get('model'), o.get('effort')) for m, a, o in members], [
             ('codex', 'codex', 'gpt-6-astra', 'medium'), ('claude', 'claude', 'claude-opus-5-5', 'high'),
@@ -1510,6 +1520,191 @@ class Council(Base):
         self.assertIn('5 of 5 members signed', out)
         self.assertEqual(max(c['concurrent'] for c in self.council_calls() if c['name'] == 'codex'), 2)
         self.assertEqual(len(self.council_calls('proposals')), 5)
+
+
+class ClaudeApiKey(Base):
+    """Claude Code signs in with its login (the default) or with the user's Anthropic API key."""
+    KEY = 'sk-ant-api03-test-key-not-real'
+
+    def key_file(self, mode=0o600, text=None):
+        path = self.home / '.config' / 'xreview' / 'anthropic-api-key'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text((self.KEY if text is None else text) + '\n')
+        path.chmod(mode)
+        return path
+
+    def claude(self, **settings):
+        self.write_config(claude=dict({'bin': str(self.tmp / 'fakes/claude')}, **settings))
+
+    def assert_key_not_stored(self, job_dir, out):
+        self.assertNotIn(self.KEY, out)
+        for path in Path(job_dir).rglob('*'):
+            if path.is_file():
+                self.assertNotIn(self.KEY, path.read_text(errors='replace'), path)
+
+    def test_login_is_the_default_and_no_anthropic_credential_leaks(self):
+        self.change()
+        shell = {'ANTHROPIC_API_KEY': 'sk-ant-from-the-shell', 'ANTHROPIC_AUTH_TOKEN': 'token',
+                 'CLAUDE_CODE_ENTRYPOINT': 'claude-desktop'}
+        code, out = self.xr('run', '--reviewer', 'claude', env=shell)
+        self.assertEqual(code, 0, out)
+        call = self.calls()[-1]
+        self.assertEqual((call['anthropic_key'], call['auth_token'], call['entrypoint'], call['config_dir']),
+                         ('sk-ant-from-the-shell', 'token', 'claude-desktop', None))  # the login path is unchanged
+        self.assertNotIn('Sign-in:', out)
+        code, out = self.xr('run', '--reviewer', 'codex', '--force', env=shell)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((self.calls()[-1]['anthropic_key'], self.calls()[-1]['auth_token']), (None, None))
+
+    def test_api_key_from_a_private_file(self):
+        self.claude(auth='api-key')
+        self.key_file()
+        self.change()
+        code, out = self.xr('run', '--reviewer', 'claude', env={'ANTHROPIC_API_KEY': 'sk-ant-from-the-shell',
+                                                                'CLAUDE_CODE_ENTRYPOINT': 'claude-desktop',
+                                                                'ANTHROPIC_BASE_URL': 'https://gateway.example'})
+        self.assertEqual(code, 0, out)
+        call = self.calls()[-1]
+        self.assertEqual(call['anthropic_key'], self.KEY)               # the file's key, not the shell's
+        self.assertFalse(call['bare'])                                  # --bare would leave only Read
+        self.assertTrue(call['config_dir_empty'])                       # its own config: no login to fall back on
+        self.assertIsNone(call['entrypoint'])                           # nor the calling app's session markers
+        self.assertIsNone(call['base_url'])                             # and the key goes to Anthropic only
+        job = Path(self.meta(self.job_id(out))['job_dir'])
+        self.assertTrue(call['config_dir'].startswith(str(job)))
+        self.assertFalse((job / 'claude-config').exists())             # deleted afterwards
+        self.assertEqual(call['role'], 'reviewer')
+        self.assertIn('- Sign-in: API key from ~/.config/xreview/anthropic-api-key', out)
+        self.assert_key_not_stored(self.meta(self.job_id(out))['job_dir'], out)
+
+    def test_a_missing_or_exposed_key_stops_the_review(self):
+        self.claude(auth='api-key')
+        self.change()
+        for prepare, message in ((lambda: None, 'does not exist'), (lambda: self.key_file(mode=0o644), 'other users can read it'),
+                                 (lambda: self.key_file(text='two words'), 'just the API key')):
+            prepare()
+            code, out = self.xr('start', '--reviewer', 'claude')
+            self.assertEqual(code, 1, out)
+            self.assertIn(message, out)
+        self.assertEqual(self.calls(), [])                              # no reviewer ran
+        self.claude(auth='api-key', api_key_env='MY_ANTHROPIC_KEY')
+        code, out = self.xr('start', '--reviewer', 'claude')
+        self.assertEqual(code, 1, out)
+        self.assertIn('$MY_ANTHROPIC_KEY, which is not set here', out)
+        code, out = self.xr('run', '--reviewer', 'claude', env={'MY_ANTHROPIC_KEY': self.KEY})
+        self.assertEqual(code, 0, out)
+        self.assertEqual((self.calls()[-1]['anthropic_key'], self.calls()[-1]['my_key']), (self.KEY, None))
+        self.assertIn('- Sign-in: API key from $MY_ANTHROPIC_KEY', out)
+        code, out = self.xr('run', '--reviewer', 'codex', env={'MY_ANTHROPIC_KEY': self.KEY})
+        self.assertEqual(code, 0, out)
+        self.assertEqual((self.calls()[-1]['anthropic_key'], self.calls()[-1]['my_key']), (None, None))
+
+    def test_choosing_per_review_and_checked_settings(self):
+        self.key_file()
+        self.change()
+        code, out = self.xr('run', '--reviewer', 'claude')
+        self.assertEqual(code, 0, out)
+        code, out = self.xr('run', '--reviewer', 'claude', '--claude-auth', 'api-key')
+        self.assertEqual(code, 0, out)                                  # not the login review again
+        self.assertNotIn('already reviewed', out)
+        self.assertEqual(self.calls()[-1]['anthropic_key'], self.KEY)
+        self.assertEqual(len(self.calls()), 2)
+        code, out = self.xr('start', '--reviewer', 'codex', '--claude-auth', 'api-key')
+        self.assertEqual(code, 1, out)
+        self.assertIn('--claude-auth applies to Claude Code reviews', out)
+        for settings, message in (({'auth': 'key'}, '"login" or "api-key"'), ({'api_key_file': ''}, 'file path'),
+                                  ({'api_key_env': 'not a name'}, 'environment variable name')):
+            self.claude(**settings)
+            code, out = self.xr('start', '--reviewer', 'claude', '--force')
+            self.assertEqual(code, 1, out)
+            self.assertIn(message, out)
+
+    def test_config_folders_are_swept_with_the_copies(self):
+        job = self.tmp / 'job'
+        for folder in ('tree', 'claude-config', 'calls/r1-proposals-claude/claude-config', 'calls/r1-proposals-codex'):
+            (job / folder).mkdir(parents=True)
+        xreview.remove_copy(job)
+        self.assertEqual(sorted(str(p.relative_to(job)) for p in job.rglob('*')),
+                         ['calls', 'calls/r1-proposals-claude', 'calls/r1-proposals-codex'])
+
+    def test_doctor_reports_the_sign_in(self):
+        self.claude(auth='api-key')
+        code, out = self.xr('doctor', '--reviewer', 'claude')
+        self.assertEqual(code, 1, out)
+        self.assertIn('FAIL Claude Code is set to use an API key', out)
+        self.key_file()
+        code, out = self.xr('doctor', '--reviewer', 'claude')
+        self.assertEqual(code, 0, out)
+        self.assertIn('use your Anthropic API key (API key from ~/.config/xreview/anthropic-api-key', out)
+        self.assertNotIn(self.KEY, out)
+        for reviewer in ('claude', 'codex'):
+            code, out = self.xr('doctor', '--live', '--reviewer', reviewer, env={'FAKE_MODE': 'blocker'})
+            self.assertEqual(code, 0, out)
+            self.assertIn('live review worked', out)
+        self.assertTrue(self.calls()[-2]['config_dir_empty'])           # the live Claude review used the key
+
+    def test_the_api_key_can_have_its_own_model(self):
+        self.claude(auth='api-key', api_model='claude-fable-5-2', api_effort='max')
+        self.key_file()
+        self.change()
+
+        def settings():
+            args = self.calls()[-1]['args']
+            return args[args.index('--model') + 1], args[args.index('--effort') + 1], bool(self.calls()[-1]['config_dir'])
+        code, out = self.xr('run', '--reviewer', 'claude')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(settings(), ('claude-fable-5-2', 'max', True))
+        code, out = self.xr('run', '--reviewer', 'claude', '--claude-auth', 'login', '--force')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(settings(), ('claude-opus-5-5', 'high', False))  # the login keeps its own model
+        code, out = self.xr('run', '--reviewer', 'claude', '--model', 'claude-sonnet-5-5', '--force')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(settings(), ('claude-sonnet-5-5', 'max', True))  # --model still wins
+        code, out = self.xr('doctor', '--reviewer', 'claude')
+        self.assertIn('reviews request model claude-fable-5-2, effort max', out)
+        brief = self.tmp / 'brief.md'
+        brief.write_text('# Which baseline next?\nPick a direction.\n')
+        self.log.unlink()
+        code, out = self.xr('council', 'run', '--brief-file', str(brief), '--members', 'claude,claude:claude-opus-5-5,codex')
+        self.assertEqual(code, 0, out)
+        models = sorted(c['args'][c['args'].index('--model') + 1] for c in self.calls()
+                        if c['name'] == 'claude' and c['phase'] == 'proposals')
+        self.assertEqual(models, ['claude-fable-5-2', 'claude-opus-5-5'])  # a member's own model wins
+        for value in (5, '', '-x'):
+            self.claude(api_model=value)
+            code, out = self.xr('start', '--reviewer', 'claude', '--force')
+            self.assertEqual(code, 1, out)
+            self.assertIn('"api_model"', out)
+
+    def test_council_members_sign_in_the_same_way(self):
+        self.key_file()
+        brief = self.tmp / 'brief.md'
+        brief.write_text('# Which baseline next?\nPick a direction.\n')
+        shell = {'ANTHROPIC_API_KEY': 'sk-ant-from-the-shell'}
+        code, out = self.xr('council', 'run', '--brief-file', str(brief), '--members',
+                            'claude,claude:claude-fable-5-1,codex,gemini', '--claude-auth', 'api-key', env=shell)
+        self.assertEqual(code, 0, out)
+        calls = [c for c in self.calls() if c.get('phase')]
+        self.assertEqual({c['anthropic_key'] for c in calls if c['name'] == 'claude'}, {self.KEY})
+        self.assertTrue(all(c['config_dir_empty'] for c in calls if c['name'] == 'claude'))
+        self.assertEqual(len({c['config_dir'] for c in calls if c['name'] == 'claude'}),
+                         len([c for c in calls if c['name'] == 'claude']))   # a fresh folder for every call
+        self.assertEqual({c['anthropic_key'] for c in calls if c['name'] != 'claude'}, {None})
+        self.assertIn('claude-fable-5-1, effort high, API key from ~/.config/xreview/anthropic-api-key', out)
+        job = None
+        for line in out.splitlines():
+            if line.startswith('Started council '):
+                job = self.tmp / 'state/jobs' / line.split()[2]
+        self.assert_key_not_stored(job, out)
+        code, out = self.xr('council', 'start', '--brief-file', str(brief), '--members', 'codex,gemini',
+                            '--claude-auth', 'api-key')
+        self.assertEqual(code, 1, out)
+        self.assertIn('this council has none', out)
+        self.log.unlink()
+        code, out = self.xr('council', 'run', '--brief-file', str(brief), '--members', 'claude,codex', env=shell)
+        self.assertEqual(code, 0, out)                                  # the login, by default
+        self.assertEqual({(c['anthropic_key'], c['config_dir']) for c in self.calls() if c['name'] == 'claude'},
+                         {('sk-ant-from-the-shell', None)})
 
 
 class PathPatterns(unittest.TestCase):

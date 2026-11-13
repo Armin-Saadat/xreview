@@ -8,6 +8,7 @@
 - [What the reviewer can read](#what-the-reviewer-can-read)
 - [Permissions in the implementing agent](#permissions-in-the-implementing-agent)
 - [Configuration](#configuration)
+  - [Claude Code with an API key](#claude-code-with-an-api-key)
 - [Project review rules](#project-review-rules)
 - [What is sent and stored](#what-is-sent-and-stored)
 - [Councils](#councils)
@@ -153,6 +154,50 @@ For Gemini, `model` is a base name from `agy models` without the effort suffix
 - Reviews are stored under `~/.local/share/xreview/jobs/` (or `XREVIEW_HOME`). Keep
   `XREVIEW_HOME` out of `/tmp` and `$TMPDIR`: Codex's profile blocks those folders, and
   Codex then refuses to read a review copy inside them.
+
+### Claude Code with an API key
+
+Claude Code reviews and Claude council members normally use the Claude login of the
+`claude` CLI. To bill an Anthropic API key instead, save the key in a file that only
+you can read, and switch the sign-in on that machine:
+
+```bash
+mkdir -p ~/.config/xreview && touch ~/.config/xreview/anthropic-api-key
+chmod 600 ~/.config/xreview/anthropic-api-key   # then paste the key into it
+```
+
+```json
+{"claude": {"auth": "api-key"}}
+```
+
+- `--claude-auth api-key` (or `login`) on `start` or `council start` chooses for one
+  review or council, without changing the file.
+- `"api_model"` and `"api_effort"` set the model and effort for API-key runs only, for
+  example `{"claude": {"auth": "api-key", "api_model": "claude-fable-5-2", "api_effort":
+  "high"}}`; a run with the Claude login keeps `model` and `effort`. `--model`,
+  `--effort` and a council member's own `claude:MODEL@EFFORT` still win.
+- Claude Code then runs with its own empty configuration folder, deleted afterwards,
+  so it finds no login to fall back on and signs in only with that key; it also loads
+  none of your Claude Code settings, hooks or plugins. Its tools (Read, Grep and Glob)
+  and confinement are the same as with the login.
+- xreview reads the key each time a Claude Code process starts, gives it to that
+  process only, and never stores or prints it. That process also starts without the
+  calling session's `CLAUDE*` variables (the Claude desktop app's
+  `CLAUDE_CODE_ENTRYPOINT`, for one, makes API-key requests fail with "Credit balance
+  is too low") and without other `ANTHROPIC_*` variables such as `ANTHROPIC_BASE_URL`,
+  so the key goes only to Anthropic. Codex and Gemini never get Anthropic credentials.
+- With the login, Claude Code runs exactly as before. A signed-in Claude Code ignores
+  an `ANTHROPIC_API_KEY` in your shell, but one that is not signed in may use it.
+- `"api_key_file"` puts the key elsewhere; xreview refuses a key file that others can
+  read. `"api_key_env": "NAME"` reads it from an environment variable instead, and no
+  reviewer or member inherits that variable; but commands that Codex runs do not see
+  variables named like `*KEY*`, so a file is the reliable choice when Codex is the
+  author.
+- A review of the same changes with a different sign-in is a new review, not a repeat.
+- API usage is billed per token: Claude Opus 5.5 costs $4 per million input tokens
+  and $20 per million output tokens, Claude Fable 5.2 $8 and $40. `doctor` shows
+  which sign-in is used, and `doctor --live --reviewer claude` runs one real review
+  with it.
 
 ## Project review rules
 

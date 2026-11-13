@@ -32,7 +32,9 @@ from this repository.
   and without settings files, hooks, plugins or MCP servers.
 - **Reviewer models:** Codex reviews with GPT-6 Astra at medium effort, and
   Claude Code with Opus 5.5 at high effort. Either can be changed per machine
-  ([configuration](skills/xreview/references/setup.md#configuration)).
+  ([configuration](skills/xreview/references/setup.md#configuration)). Claude Code
+  signs in with its Claude login, or with your Anthropic API key if you choose
+  ([details](skills/xreview/references/setup.md#claude-code-with-an-api-key)).
 - **Gemini on request.** `--reviewer gemini` has Gemini 4 Argon review instead,
   through Google's Antigravity CLI (`agy`). It is never the default. Because agy
   has no read-only mode, xreview confines it with a hook that allows only reading

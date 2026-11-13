@@ -41,6 +41,8 @@ the user asks for it.
      `--members claude,claude:claude-fable-5-1,codex:gpt-6.1-sol@high,gemini`. Use
      the model names the user gives; xreview does not check them.
    - `--rounds N` (3 to 10, default 5) only if asked.
+   - `--claude-auth api-key` (or `login`) only if the user asks how the Claude Code
+     members sign in: with their Claude login, or with the user's API key.
 
    It prints a council id. If your shell runs commands in a sandbox without
    network access, run it outside the sandbox.

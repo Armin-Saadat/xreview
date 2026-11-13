@@ -71,6 +71,10 @@ the repository itself; they are not loaded into projects that install the plugin
   an answer is asked for once more, with the reason, never repaired; a failed call
   (error, timeout) is not repeated. Reviews stay strict throughout.
 - Never print or send credentials. Extend `SECRET_GLOBS` rather than special-casing.
+  Anthropic credentials reach no Codex or Gemini process. A Claude Code process set to
+  `"auth": "api-key"` gets only the key xreview read for it and its own empty
+  `CLAUDE_CONFIG_DIR`, so it never falls back to the Claude login (not `--bare`, which
+  drops Grep and Glob); on the login it runs as before.
 - Every behaviour change gets a test in `tests/test_xreview.py`. Use the fake CLI
   (`FAKE_MODE`) rather than real model calls.
 - After substantive changes, have xreview review itself: run
